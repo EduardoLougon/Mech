@@ -28,7 +28,7 @@ export function createPerception(config: Config): PerceptionModule {
       dodgeVec: dodge.dodgeVec,
       dodgeUrgency: dodge.dodgeUrgency,
       wantJump: false,
-      chargingLaserThreat: false,
+      chargingLaserThreat: dodge.chargingLaserThreat,
       primaryThreatBearing: tracked.primaryThreatBearing,
       spottedByCount: tracked.spottedByCount,
       ffaConfidence: tracked.ffaConfidence,

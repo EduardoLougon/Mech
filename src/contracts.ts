@@ -70,6 +70,7 @@ export interface WorldQuery {
     eyeHeight?: number,
     prevCover?: Vec3 | null,
     mechRadius?: number,
+    optRange?: number,
   ): Vec3 | null
   /** Find a defensible safe-zone rooftop (10-26m sweet-spot height, wide area, penthouse bonus) within `maxDist`. */
   findRooftopSpot(
@@ -78,6 +79,26 @@ export interface WorldQuery {
     zoneRadius: number,
     maxDist: number,
     threats: Vec3[],
+  ): Vec3 | null
+  /** Stay on the connected roof: when attacking (targetPos != null), enforce pitch >= minPitch + 0.05 and minimize exposure to otherThreats; when healing (targetPos == null), step recessed / behind penthouse. */
+  findRoofCombatSpot(
+    pos: Vec3,
+    targetPos: Vec3 | null,
+    otherThreats: Vec3[],
+    optRange: number,
+    isSafe?: (x: number, y: number) => boolean,
+    eyeHeight?: number,
+    minPitch?: number,
+    prevCover?: Vec3 | null,
+  ): Vec3 | null
+  /** Emergency roof-escape for regen_hide: scan precomputed rooftops (10-maxRelH tall) within maxEdgeDist of pos that are safe and unoccupied. */
+  findEmergencyRoofEscape(
+    pos: Vec3,
+    maxRelH: number,
+    maxEdgeDist: number,
+    threats: Vec3[],
+    isSafe?: (x: number, y: number) => boolean,
+    eyeHeight?: number,
   ): Vec3 | null
 }
 

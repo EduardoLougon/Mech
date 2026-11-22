@@ -39,11 +39,11 @@ run((hello) => {
   let eaveBackoffDir: Vec2 = [0, 0]
 
   log(
-    `mech-hydra-v5 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
+    `mech-hydra-v6 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
   )
 
   return {
-    name: "mech-hydra-v5",
+    name: "mech-hydra-v6",
     act(obs: Observation): BotAction {
       const t0 = performance.now()
       const me = obs.self
@@ -196,6 +196,8 @@ run((hello) => {
       }
 
       // Wall-safe local steering applied AFTER dodge blending (bypassed during intentional roof mantle)
+      const onRoofNow = z > world.heightAt(x, y) + 2.5
+      const keepOnRoof = onRoofNow && (!goal || goal[2] >= z - 2.5)
       const moveMagPreSteer = Math.hypot(move[0], move[1])
       if (!activeClimb && moveMagPreSteer > 1e-4) {
         const steerTarget: Vec3 = [
@@ -210,6 +212,7 @@ run((hello) => {
           maxSlopeDeg,
           mechRadius,
           mechHeight,
+          keepOnRoof,
         )
       }
 
@@ -257,7 +260,10 @@ run((hello) => {
         stuckTicks = 0
       }
 
-      // Smart boost policy: ALWAYS gate sprint boost on `me.grounded` so we never accidentally sky-jet!
+      // Smart boost policy: ALWAYS gate sprint boost on `me.grounded` AND reserve climb energy when heading to a roof!
+      const wantRoofGoal =
+        goal !== null && goal[2] > world.heightAt(goal[0], goal[1]) + 2.5 && goal[2] > z + 1.5
+      const climbReserve = wantRoofGoal && goal ? Math.max(0, 1.5 * (goal[2] - z) + 18) : 0
       const hasLightning = me.weapons.some((w) => w?.kind === "lightning")
       const closeLightningThreat =
         !hasLightning &&
@@ -271,23 +277,23 @@ run((hello) => {
       if (!activeClimb && me.grounded) {
         if (!me.in_zone && me.energy > 12) {
           boost = true
-        } else if (order.mode === "zone_sprint" && me.energy > 35) {
+        } else if (order.mode === "zone_sprint" && me.energy > Math.max(35, climbReserve)) {
           boost = true
         } else if (
           order.mode === "regen_hide" &&
-          me.energy > 18
+          me.energy > Math.max(18, climbReserve)
         ) {
           boost = true
         } else if (
           (threats.chargingLaserThreat || closeLightningThreat) &&
-          me.energy > 22
+          me.energy > Math.max(22, climbReserve)
         ) {
           boost = true
         } else if (
           (order.mode === "contest_drop" || order.mode === "farm_crate") &&
           goal &&
           Math.hypot(goal[0] - x, goal[1] - y) > 22 &&
-          me.energy > 55
+          me.energy > Math.max(55, climbReserve)
         ) {
           boost = true
         }
@@ -305,7 +311,7 @@ run((hello) => {
         draw.point(goal, "#40c0ff", 5)
       }
       draw.label(
-        `v5 ${order.mode} c=${me.cubes} hp=${me.hp.toFixed(0)}`,
+        `v6 ${order.mode} c=${me.cubes} hp=${me.hp.toFixed(0)}`,
       )
 
       return act

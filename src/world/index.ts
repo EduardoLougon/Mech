@@ -3,8 +3,10 @@ import { loadWorldData } from "./loader.ts"
 import {
   buildNavGrid,
   findCover,
+  findEmergencyRoofEscape,
   findPath,
   findPeekCover,
+  findRoofCombatSpot,
   findRooftopSpot,
 } from "./nav.ts"
 import {
@@ -106,6 +108,7 @@ export function createWorld(mapDir: string, config: Config): WorldQuery {
       eyeHeight = 8,
       prevCover?: Vec3 | null,
       mechRadius = 2.5,
+      optRange?: number,
     ): Vec3 | null {
       return findPeekCover(
         nav,
@@ -119,6 +122,7 @@ export function createWorld(mapDir: string, config: Config): WorldQuery {
         eyeHeight,
         prevCover,
         mechRadius,
+        optRange,
       )
     },
     findRooftopSpot(
@@ -129,6 +133,50 @@ export function createWorld(mapDir: string, config: Config): WorldQuery {
       threats: Vec3[],
     ): Vec3 | null {
       return findRooftopSpot(nav, pos, zoneCenter, zoneRadius, maxDist, threats)
+    },
+    findRoofCombatSpot(
+      pos: Vec3,
+      targetPos: Vec3 | null,
+      otherThreats: Vec3[],
+      optRange: number,
+      isSafe?: (x: number, y: number) => boolean,
+      eyeHeight = 8,
+      minPitch = -0.7,
+      prevCover: Vec3 | null = null,
+    ): Vec3 | null {
+      return findRoofCombatSpot(
+        nav,
+        world,
+        scratch,
+        pos,
+        targetPos,
+        otherThreats,
+        optRange,
+        isSafe,
+        eyeHeight,
+        minPitch,
+        prevCover,
+      )
+    },
+    findEmergencyRoofEscape(
+      pos: Vec3,
+      maxRelH: number,
+      maxEdgeDist: number,
+      threats: Vec3[],
+      isSafe?: (x: number, y: number) => boolean,
+      eyeHeight = 8,
+    ): Vec3 | null {
+      return findEmergencyRoofEscape(
+        nav,
+        world,
+        scratch,
+        pos,
+        maxRelH,
+        maxEdgeDist,
+        threats,
+        isSafe,
+        eyeHeight,
+      )
     },
   }
 }
@@ -175,6 +223,7 @@ export function computeLocalSteer(
   maxSlopeDeg = 50,
   mechRadius = 2.5,
   mechHeight = 9.0,
+  keepOnRoof = false,
 ): Vec2 {
   const dx = target[0] - pos[0]
   const dy = target[1] - pos[1]
@@ -183,8 +232,6 @@ export function computeLocalSteer(
 
   const baseYaw = Math.atan2(dy, dx)
   const steps = dist < 2.0 ? [dist] : [2.0, Math.min(4.0, dist)]
-  // Never trap the bot on a roof edge when leaving a roof
-  const keepOnRoof = false
 
   // Pass 1: 2m and 4m feeler steps with full mechRadius clearance
   for (let i = 0; i < STEER_ANGLES.length; i++) {

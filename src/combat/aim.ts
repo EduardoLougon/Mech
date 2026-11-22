@@ -48,6 +48,8 @@ export function solveGunIntercept(
   speed: number,
   range: number,
   world: WorldQuery,
+  barrelOffset = 3.0,
+  minZAboveSurf = 1.0,
 ): { aim: Vec2; intercept: Vec3; t: number } | null {
   const px = targetPos[0] - muzzle[0]
   const py = targetPos[1] - muzzle[1]
@@ -78,26 +80,52 @@ export function solveGunIntercept(
 
   if (t <= 0) {
     const dist = Math.hypot(px, py, pz)
-    if (dist > range) return null
-    t = dist / speed
+    if (dist - barrelOffset > range) return null
+    t = Math.max(0, (dist - barrelOffset) / speed)
+  } else {
+    t = Math.max(0, t - barrelOffset / speed)
   }
 
-  const vzLead = Math.abs(vz) > 2.0 ? vz * t - 0.5 * 22 * t * t : vz * t
+  const vzLead =
+    vz < -2.0
+      ? vz * t - 0.5 * 22 * t * t
+      : vz > 2.0
+        ? vz * t - 0.5 * 6 * t * t
+        : vz * t
+  const ix = targetPos[0] + vx * t
+  const iy = targetPos[1] + vy * t
   const rawZ = targetPos[2] + vzLead
-  const groundZ = world.heightAt(targetPos[0] + vx * t, targetPos[1] + vy * t)
-  const intercept: Vec3 = [
-    targetPos[0] + vx * t,
-    targetPos[1] + vy * t,
-    Math.max(groundZ + 1.0, rawZ),
-  ]
+  const surfZ = world.surfaceZAt(ix, iy, targetPos[2])
+  let intercept: Vec3 = [ix, iy, Math.max(surfZ + minZAboveSurf, rawZ)]
 
   const shotDist = Math.hypot(
     intercept[0] - muzzle[0],
     intercept[1] - muzzle[1],
     intercept[2] - muzzle[2],
   )
-  if (shotDist > range) return null
-  if (!world.hasShotLOS(muzzle, intercept)) return null
+  if (shotDist - barrelOffset > range) return null
+  if (!world.hasShotLOS(muzzle, intercept)) {
+    if (!world.hasShotLOS(muzzle, targetPos)) return null
+    // 3-step binary search wall-corner bisection along targetPos -> intercept
+    let lo = 0
+    let hi = 1
+    let bestPt: Vec3 = targetPos
+    for (let step = 0; step < 3; step++) {
+      const mid = 0.5 * (lo + hi)
+      const cand: Vec3 = [
+        targetPos[0] + (intercept[0] - targetPos[0]) * mid,
+        targetPos[1] + (intercept[1] - targetPos[1]) * mid,
+        targetPos[2] + (intercept[2] - targetPos[2]) * mid,
+      ]
+      if (world.hasShotLOS(muzzle, cand)) {
+        bestPt = cand
+        lo = mid
+      } else {
+        hi = mid
+      }
+    }
+    intercept = bestPt
+  }
 
   return {
     aim: solveDirectAim(muzzle, intercept),

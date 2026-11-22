@@ -75,19 +75,21 @@ function findKillConfirmTarget(
   world: WorldQuery,
   eyeHeight: number,
 ): TrackedEnemy | null {
-  // Strictly gate kill-confirm: never suicide at low HP or in a 1v2+
-  if (obs.self.hp <= 480 || spottedByCount > 1) return null
+  // Allow 1v1 kill-confirm at >480 HP, and 1v2 kill-confirm at >720 HP against <=260 HP targets
+  if (obs.self.hp <= 480 || spottedByCount > 2) return null
+  if (spottedByCount === 2 && obs.self.hp <= 720) return null
+  const maxConfirmHp = spottedByCount === 2 ? 260 : 340
 
   let best: TrackedEnemy | null = null
   let bestScore = -Infinity
 
   for (const e of realMechs) {
     if (e.confidence < 0.9) continue
-    if (e.hp <= 0 || e.hp > 340) continue
+    if (e.hp <= 0 || e.hp > maxConfirmHp) continue
     if (!hasMechShotLOS(obs, world, e.pos, eyeHeight)) continue
 
     const d = dist2D(obs.self.pos, e.pos)
-    const score = (340 - e.hp) * 1.2 - d * 0.5
+    const score = (maxConfirmHp - e.hp) * 1.2 - d * 0.5
     if (score > bestScore) {
       bestScore = score
       best = e
@@ -155,6 +157,7 @@ function pickBestMechTarget(
   let best: TrackedEnemy | null = null
   let bestScore = -Infinity
 
+  const hasLaser = obs.self.weapons.some((w) => w?.kind === "laser")
   for (const e of realMechs) {
     const d = dist2D(obs.self.pos, e.pos)
     const hpRatio = e.hp / Math.max(1, e.maxHp)
@@ -163,6 +166,8 @@ function pickBestMechTarget(
     let score = (1 - hpRatio) * 115 + e.confidence * 70 - d * 0.55
     if (e.hp > 0 && e.hp <= 340) score += 55
     if (e.charging) score += 18
+    if (hasLaser && e.weapons.includes("mortar")) score += 40
+    if (e.cubes <= 2 && obs.t < 150) score += 20
     if (e.confidence >= 0.9 && hasMechShotLOS(obs, world, e.pos, eyeHeight)) {
       score += 22
     }
@@ -577,11 +582,16 @@ export function createStrategy(config: Config): Strategy {
         if (u === "nanites") naniteStacks++
       }
 
+      const onRoof =
+        obs.self.pos[2] > world.heightAt(obs.self.pos[0], obs.self.pos[1]) + 2.5
+      const minPitch = obs.self.stats.min_pitch ?? config.mech.min_pitch ?? -0.7
+      const hasEmptySlot = obs.self.weapons.some((w) => w === null)
+
       let enterRegenRatio: number
       if (threats.spottedByCount >= 2) {
-        enterRegenRatio = naniteStacks >= 2 ? 0.52 : 0.48
+        enterRegenRatio = naniteStacks >= 2 ? 0.54 : 0.52
       } else {
-        enterRegenRatio = naniteStacks >= 2 ? 0.45 : 0.40
+        enterRegenRatio = naniteStacks >= 2 || obs.self.cubes < 4 ? 0.45 : 0.40
       }
 
       const exitRegenRatio = naniteStacks >= 1 ? 0.86 : 0.82
@@ -593,31 +603,74 @@ export function createStrategy(config: Config): Strategy {
       }
 
       if (inRegenHide && obs.self.in_zone) {
-        const retreat = findRetreatTarget(
-          obs,
-          realMechs,
-          world,
-          eyeHeight,
-          activePrevCover,
-          mechRadius,
-        )
-        if (retreat.usedCover) {
-          latchCover(retreat.target, obs.t)
+        const isSafe = (cx: number, cy: number) => isPointInSafeZone([cx, cy], obs, 4)
+        let retreatTarget: Vec3 | null = null
+        let usedCover = false
+
+        if (onRoof) {
+          // Stay on roof and step recessed / behind penthouse to break ground LOS!
+          const roofHealSpot = world.findRoofCombatSpot(
+            obs.self.pos,
+            null,
+            realMechPositions,
+            60,
+            isSafe,
+            eyeHeight,
+            minPitch,
+            activePrevCover,
+          )
+          if (roofHealSpot) {
+            retreatTarget = roofHealSpot
+            usedCover = true
+          }
+        } else if (hpRatio < 0.48 && obs.self.energy >= 45 && realMechPositions.length > 0) {
+          // Emergency roof-escape: jet onto a nearby 10-22m roof to break ground LOS!
+          const maxRelH = Math.min(22, (obs.self.energy - 14) / 1.5)
+          const roofEscape = world.findEmergencyRoofEscape(
+            obs.self.pos,
+            maxRelH,
+            20,
+            realMechPositions,
+            isSafe,
+            eyeHeight,
+          )
+          if (roofEscape) {
+            retreatTarget = roofEscape
+            usedCover = true
+          }
         }
-        // Hold fire to complete 2-5s Nanite regen when cover is available or unspotted;
-        // only shoot back if an enemy is right on top of us (< 26m)
+
+        if (!retreatTarget) {
+          const retreat = findRetreatTarget(
+            obs,
+            realMechs,
+            world,
+            eyeHeight,
+            activePrevCover,
+            mechRadius,
+          )
+          retreatTarget = retreat.target
+          usedCover = retreat.usedCover
+        }
+
+        if (usedCover) {
+          latchCover(retreatTarget, obs.t)
+        }
+        // Only hold fire when unspotted, or already at/entering cover (<= 8m), or desperate (< 28% HP);
+        // keep shooting back while dashing to cover so we don't eat free damage!
+        const atCover = usedCover && dist2D(obs.self.pos, retreatTarget) <= 8
         const chasedClose = threats.spottedByCount > 0 && nearestRealMechDist < 26
-        const canActuallyBreakLOS =
-          (retreat.usedCover || threats.spottedByCount === 0) && !chasedClose
+        const shouldHoldFire =
+          (threats.spottedByCount === 0 || atCover || hpRatio < 0.28) && !chasedClose
         return {
           pick,
           order: {
             mode: "regen_hide",
-            moveTarget: retreat.target,
-            primaryTargetId: canActuallyBreakLOS ? null : (realMechs[0]?.id ?? null),
+            moveTarget: retreatTarget,
+            primaryTargetId: shouldHoldFire ? null : (realMechs[0]?.id ?? null),
             desiredLoadout,
             preferSilent: false,
-            holdFireForRegen: canActuallyBreakLOS,
+            holdFireForRegen: shouldHoldFire,
           },
         }
       }
@@ -633,14 +686,20 @@ export function createStrategy(config: Config): Strategy {
           if (!isPointInSafeZone(drop.pos, obs, 4)) continue
 
           const myDist = dist2D(obs.self.pos, drop.pos)
-          const maxDropDist = hpRatio < 0.70 ? 220 : 180
+          const maxDropDist = hpRatio < 0.65 ? 110 : 165
           if (myDist > maxDropDist) continue
-          // Don't march past a close enemy who is actively fighting us
-          if (nearestRealMechDist <= 45 && myDist > drop.radius + 14) continue
           const almostCaptured =
             (drop.holder === obs.self.id || myDist <= drop.radius + 4) &&
             drop.progress >= 2.2 &&
             hpRatio > 0.4
+          // Don't abandon an active fight or run past a nearby enemy unless already capturing
+          if (
+            !almostCaptured &&
+            myDist > drop.radius + 14 &&
+            (threats.spottedByCount > 0 || nearestRealMechDist <= 65)
+          ) {
+            continue
+          }
 
           if (isPractice) {
             if (
@@ -759,14 +818,13 @@ export function createStrategy(config: Config): Strategy {
         const inCombatOrCloseMech =
           threats.spottedByCount > 0 || nearestRealMechDist <= 55
 
-        // 4a. Loose cubes: scoop up to 10, and 12..14 to hit the 15-cube 5th upgrade; stop >= 15
+        // 4a. Loose cubes: scoop up to 10, and 12..14 to hit the 15-cube 5th upgrade; never override engage in combat!
         const wantLooseCubes =
           obs.self.cubes < 10 || (obs.self.cubes >= 12 && obs.self.cubes < 15)
 
-        if (wantLooseCubes) {
-          const maxCubeDist = inCombatOrCloseMech ? 10 : 45
+        if (wantLooseCubes && !inCombatOrCloseMech) {
           let bestCubePos: Vec3 | null = null
-          let bestCubeDist = maxCubeDist
+          let bestCubeDist = 45
           for (const c of obs.cubes) {
             if (!isPointInSafeZone(c.pos, obs, 6)) continue
             const d = dist2D(obs.self.pos, c.pos)
@@ -790,9 +848,20 @@ export function createStrategy(config: Config): Strategy {
           }
         }
 
-        // 4b. Grab desired floor pickups (combat-gated to < 10m when threatened, mortar <= 18m)
-        const maxPickupDist = inCombatOrCloseMech ? 10 : 70
-        const pickupPos = findDesiredPickup(obs, desiredLoadout, maxPickupDist, realMechs)
+        // 4b. Grab desired floor pickups — when slot 1 is EMPTY, search up to 130m (or 25m under light pressure) to fix gun+null deaths!
+        const maxPickupDist = hasEmptySlot
+          ? !inCombatOrCloseMech
+            ? 130
+            : hpRatio > 0.55 && threats.spottedByCount <= 1
+              ? 25
+              : 0
+          : !inCombatOrCloseMech
+            ? 70
+            : 0
+        const pickupPos =
+          maxPickupDist > 0
+            ? findDesiredPickup(obs, desiredLoadout, maxPickupDist, realMechs)
+            : null
         if (pickupPos) {
           return {
             pick,
@@ -807,11 +876,13 @@ export function createStrategy(config: Config): Strategy {
           }
         }
 
-        // 4c. Farm crates & NPCs up to 10 cubes when unspotted & nearest real mech > 60m
-        const safeToFarm = threats.spottedByCount === 0 && nearestRealMechDist > 60
+        // 4c. Farm crates (50% weapon drop!) & NPCs up to 10 cubes
+        const safeToFarm =
+          threats.spottedByCount === 0 && nearestRealMechDist > 60 && hpRatio >= 0.62
+        const emptySlotCrateUrgent =
+          hasEmptySlot && threats.spottedByCount === 0 && nearestRealMechDist > 35 && hpRatio > 0.55
 
-        if (obs.self.cubes < 10 && safeToFarm) {
-          const hasEmptySlot = obs.self.weapons.some((w) => w === null)
+        if ((obs.self.cubes < 10 && safeToFarm) || emptySlotCrateUrgent) {
           let bestFarmMode: "farm_crate" | "farm_npc" | null = null
           let bestFarmPos: Vec3 | null = null
           let bestFarmTargetId: number | null = null
@@ -822,33 +893,39 @@ export function createStrategy(config: Config): Strategy {
             // Skip crates high on unreachable rooftops when on ground (or far below when on roof)
             if (Math.abs(crate.pos[2] - obs.self.pos[2]) > 3.5) continue
             const d = dist2D(obs.self.pos, crate.pos)
-            if (d > 95) continue
+            if (d > (hasEmptySlot ? 115 : 95)) continue
             if (countMechsNear(realMechs, crate.pos, 30) > 0) continue
 
-            const score = (hasEmptySlot ? 60 : 45) - d
+            const score = (hasEmptySlot ? 75 : 45) - d
             if (score > bestFarmScore) {
               bestFarmScore = score
               bestFarmMode = "farm_crate"
-              // Stand 16m back so pitch (-0.36 rad) stays well inside min_pitch (-0.7 rad)!
-              bestFarmPos = getStandoffPoint(obs.self.pos, crate.pos, 16, obs, world)
+              // Stand 16m back so pitch (-0.36 rad) stays well inside min_pitch (-0.7 rad), falling back to 10m if blocked
+              const p16 = getStandoffPoint(obs.self.pos, crate.pos, 16, obs, world)
+              const crateMid: Vec3 = [crate.pos[0], crate.pos[1], crate.pos[2] + 1.0]
+              bestFarmPos = world.hasShotLOS([p16[0], p16[1], p16[2] + 7], crateMid)
+                ? p16
+                : getStandoffPoint(obs.self.pos, crate.pos, 10, obs, world)
               bestFarmTargetId = null
             }
           }
 
-          for (const e of threats.enemies) {
-            if (e.kind !== "npc" || e.id < 0) continue
-            if (!isPointInSafeZone(e.pos, obs, 6)) continue
-            const d = dist2D(obs.self.pos, e.pos)
-            if (d > 95) continue
-            if (countMechsNear(realMechs, e.pos, 30) > 0) continue
+          if (safeToFarm && obs.self.cubes < 10) {
+            for (const e of threats.enemies) {
+              if (e.kind !== "npc" || e.id < 0) continue
+              if (!isPointInSafeZone(e.pos, obs, 6)) continue
+              const d = dist2D(obs.self.pos, e.pos)
+              if (d > 95) continue
+              if (countMechsNear(realMechs, e.pos, 30) > 0) continue
 
-            // NPCs drop 2 cubes vs 1 for crate; snipe from 56m (outside 45m NPC aggro range = 0 damage!)
-            const score = 72 - d
-            if (score > bestFarmScore) {
-              bestFarmScore = score
-              bestFarmMode = "farm_npc"
-              bestFarmPos = getStandoffPoint(obs.self.pos, e.pos, 56, obs, world)
-              bestFarmTargetId = e.id
+              // NPCs drop 2 cubes vs 1 for crate; snipe from 56m (outside 45m NPC aggro range = 0 damage!)
+              const score = 72 - d
+              if (score > bestFarmScore) {
+                bestFarmScore = score
+                bestFarmMode = "farm_npc"
+                bestFarmPos = getStandoffPoint(obs.self.pos, e.pos, 56, obs, world)
+                bestFarmTargetId = e.id
+              }
             }
           }
 
@@ -874,7 +951,11 @@ export function createStrategy(config: Config): Strategy {
         activeSoundGoal = null
 
         const otherMechs = realMechs
-          .filter((e) => e.id !== bestMech.id && dist2D(obs.self.pos, e.pos) <= 140)
+          .filter((e) => {
+            if (e.id === bestMech.id) return false
+            const d = dist2D(obs.self.pos, e.pos)
+            return d <= 110 && (e.confidence >= 0.85 || d <= 65)
+          })
           .map((e) => e.pos)
 
         const optRange = computeOptimalCombatRange(
@@ -887,8 +968,24 @@ export function createStrategy(config: Config): Strategy {
         const isSafe = (cx: number, cy: number) => isPointInSafeZone([cx, cy], obs, 4)
 
         let moveTarget: Vec3
-        if (otherMechs.length > 0) {
-          // Early 1vN Slice-the-Pie: isolate bestMech behind cover from ANY other real mech <= 140m
+        const roofCombatSpot = onRoof
+          ? world.findRoofCombatSpot(
+              obs.self.pos,
+              bestMech.pos,
+              otherMechs,
+              optRange,
+              isSafe,
+              eyeHeight,
+              minPitch,
+              activePrevCover,
+            )
+          : null
+
+        if (roofCombatSpot) {
+          latchCover(roofCombatSpot, obs.t)
+          moveTarget = roofCombatSpot
+        } else if (otherMechs.length > 0) {
+          // Early 1vN Slice-the-Pie: isolate bestMech behind cover from imminent secondary threats
           const peekCover = world.findPeekCover(
             obs.self.pos,
             bestMech.pos,
@@ -898,6 +995,7 @@ export function createStrategy(config: Config): Strategy {
             eyeHeight,
             activePrevCover,
             mechRadius,
+            optRange,
           )
           if (peekCover) {
             latchCover(peekCover, obs.t)
@@ -1006,10 +1104,15 @@ export function createStrategy(config: Config): Strategy {
 
       // Claim defensible high ground (12-24m wide roofs / penthouses) ONLY once farmed (>= 6 cubes) or mid/late game (>= 75s)
       if (activeRoofSpot !== null) {
+        const sameElevEnemyClose = realMechs.some(
+          (e) =>
+            Math.abs(e.pos[2] - activeRoofSpot![2]) < 5 &&
+            dist2D(e.pos, activeRoofSpot!) < 35,
+        )
         const roofUnsafe =
           obs.t > activeRoofExpireT ||
           !isPointInSafeZone(activeRoofSpot, obs, 6) ||
-          countMechsNear(realMechs, activeRoofSpot, 35) > 0 ||
+          sameElevEnemyClose ||
           (obs.self.cubes < 6 && obs.t < 75)
         if (roofUnsafe) {
           activeRoofSpot = null

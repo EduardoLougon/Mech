@@ -1021,6 +1021,7 @@ export function findPeekCover(
   eyeHeight = 8,
   prevCover?: Vec3 | null,
   mechRadius = 2.5,
+  optRange?: number,
 ): Vec3 | null {
   const threatCount = otherThreats.length
   if (threatCount === 0 || radius <= 0) return null
@@ -1120,6 +1121,10 @@ export function findPeekCover(
 
       const minThreatDist = Math.sqrt(minThreatDistSq)
       let score = pathDist - 0.55 * minThreatDist
+      if (optRange !== undefined) {
+        const distToTarget = Math.hypot(wx - targetPos[0], wy - targetPos[1])
+        score += Math.abs(distToTarget - optRange) * 0.25
+      }
       if (cellNearCover[idx] === 1) {
         score -= 4
       }
@@ -1205,6 +1210,251 @@ export function findRooftopSpot(
         if (td < 35) score -= 20
       }
     }
+
+    if (score > bestScore) {
+      bestScore = score
+      best = r
+    }
+  }
+
+  return best ? [best.x, best.y, best.z] : null
+}
+
+function hasRoofPenthouse(nav: NavGrid, gx: number, gy: number, roofZ: number): boolean {
+  const { nx, ny, cellRoofZ } = nav
+  const y0 = Math.max(0, gy - 2)
+  const y1 = Math.min(ny - 1, gy + 2)
+  const x0 = Math.max(0, gx - 2)
+  const x1 = Math.min(nx - 1, gx + 2)
+  const threshold = roofZ + 4.5
+  for (let py = y0; py <= y1; py++) {
+    const pRow = py * nx
+    for (let px = x0; px <= x1; px++) {
+      if (cellRoofZ[pRow + px] >= threshold) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+export function findRoofCombatSpot(
+  nav: NavGrid,
+  world: WorldData,
+  scratch: RaycastScratch,
+  pos: Vec3,
+  targetPos: Vec3 | null,
+  otherThreats: Vec3[],
+  optRange: number,
+  isSafe?: (x: number, y: number) => boolean,
+  eyeHeight = 8,
+  minPitch = -0.7,
+  prevCover: Vec3 | null = null,
+): Vec3 | null {
+  const { count, onRoof, startZ } = runLocalBfs(nav, pos, 40)
+  if (!onRoof || count === 0) return null
+
+  const { nx, minX, minY, step, cellZ, cellRoofZ, bfsVisited, bfsDist, bfsZ } = nav
+  const threatCount = otherThreats.length
+  const shoulderOff = 1.9
+  const muzzleOffset = Math.max(6, eyeHeight - 1)
+  const minAllowedPitch = minPitch + 0.05
+
+  const candMuzzle: Vec3 = [0, 0, 0]
+  const candEye: Vec3 = [0, 0, 0]
+  const threatEye: Vec3 = [0, 0, 0]
+  const targetCenter: Vec3 | null =
+    targetPos !== null ? [targetPos[0], targetPos[1], targetPos[2] + 4.5] : null
+
+  let bestCandidate: Vec3 | null = null
+  let bestExposed = Infinity
+  let bestScore = Infinity
+
+  for (let i = 0; i < count; i++) {
+    const idx = bfsVisited[i]
+    if (cellRoofZ[idx] <= cellZ[idx] + 1.5 || Math.abs(cellRoofZ[idx] - startZ) > 3.0) {
+      continue
+    }
+
+    const gx = idx % nx
+    const gy = (idx / nx) | 0
+    const wx = minX + (gx + 0.5) * step
+    const wy = minY + (gy + 0.5) * step
+    if (isSafe && !isSafe(wx, wy)) continue
+
+    const wz = bfsZ[idx]
+    const pathDist = bfsDist[idx]
+
+    if (targetCenter !== null && targetPos !== null) {
+      const horizDist = Math.hypot(targetPos[0] - wx, targetPos[1] - wy)
+      const pitch = Math.atan2(targetCenter[2] - (wz + muzzleOffset), Math.max(0.1, horizDist))
+      if (pitch < minAllowedPitch) continue
+
+      candMuzzle[0] = wx
+      candMuzzle[1] = wy
+      candMuzzle[2] = wz + muzzleOffset
+      if (!hasShotLOS(world, scratch, candMuzzle, targetCenter)) continue
+
+      let exposed = 0
+      for (let t = 0; t < threatCount; t++) {
+        if (
+          isExposedToThreat(
+            world,
+            scratch,
+            wx,
+            wy,
+            wz,
+            otherThreats[t],
+            eyeHeight,
+            shoulderOff,
+            threatEye,
+            candEye,
+          )
+        ) {
+          exposed++
+          if (exposed > bestExposed) break
+        }
+      }
+      if (exposed > bestExposed) continue
+
+      let score = Math.abs(horizDist - optRange) * 0.25 + pathDist * 0.4
+      if (hasRoofPenthouse(nav, gx, gy, wz)) {
+        score -= 6
+      }
+      if (prevCover !== null) {
+        const pdx = wx - prevCover[0]
+        const pdy = wy - prevCover[1]
+        if (pdx * pdx + pdy * pdy <= 9) {
+          score -= 8
+        }
+      }
+
+      if (exposed < bestExposed || score < bestScore) {
+        bestExposed = exposed
+        bestScore = score
+        bestCandidate = [wx, wy, wz]
+      }
+    } else {
+      let exposed = 0
+      let minThreatDistSq = Infinity
+
+      for (let t = 0; t < threatCount; t++) {
+        const th = otherThreats[t]
+        const tdx = wx - th[0]
+        const tdy = wy - th[1]
+        const tDistSq = tdx * tdx + tdy * tdy
+        if (tDistSq < minThreatDistSq) minThreatDistSq = tDistSq
+
+        if (
+          isExposedToThreat(
+            world,
+            scratch,
+            wx,
+            wy,
+            wz,
+            th,
+            eyeHeight,
+            shoulderOff,
+            threatEye,
+            candEye,
+          )
+        ) {
+          exposed++
+          if (exposed > bestExposed) break
+        }
+      }
+      if (exposed > bestExposed) continue
+
+      const minThreatDist = threatCount > 0 ? Math.sqrt(minThreatDistSq) : 0
+      let score = pathDist - 0.5 * minThreatDist
+      if (hasRoofPenthouse(nav, gx, gy, wz)) {
+        score -= 4
+      }
+      if (prevCover !== null) {
+        const pdx = wx - prevCover[0]
+        const pdy = wy - prevCover[1]
+        if (pdx * pdx + pdy * pdy <= 9) {
+          score -= 8
+        }
+      }
+
+      if (exposed < bestExposed || score < bestScore) {
+        bestExposed = exposed
+        bestScore = score
+        bestCandidate = [wx, wy, wz]
+      }
+    }
+  }
+
+  return bestCandidate
+}
+
+export function findEmergencyRoofEscape(
+  nav: NavGrid,
+  world: WorldData,
+  scratch: RaycastScratch,
+  pos: Vec3,
+  maxRelH: number,
+  maxEdgeDist: number,
+  threats: Vec3[],
+  isSafe?: (x: number, y: number) => boolean,
+  eyeHeight = 8,
+): Vec3 | null {
+  const { rooftops } = nav
+  if (rooftops.length === 0 || maxRelH < 10 || maxEdgeDist <= 0) return null
+
+  const threatCount = threats.length
+  const shoulderOff = 1.9
+  const candEye: Vec3 = [0, 0, 0]
+  const threatEye: Vec3 = [0, 0, 0]
+
+  let best: RooftopSpot | null = null
+  let bestScore = -Infinity
+
+  for (let i = 0; i < rooftops.length; i++) {
+    const r = rooftops[i]
+    if (r.relH < 10 || r.relH > maxRelH) continue
+
+    const dist = Math.hypot(r.x - pos[0], r.y - pos[1])
+    const maxAllowedDist = Math.min(28, maxEdgeDist + r.edgeDist * 4)
+    if (dist > maxAllowedDist) continue
+
+    if (isSafe && !isSafe(r.x, r.y)) continue
+
+    let occupied = false
+    for (let t = 0; t < threatCount; t++) {
+      const th = threats[t]
+      if (th[2] > r.z - 4 && Math.hypot(th[0] - r.x, th[1] - r.y) < 35) {
+        occupied = true
+        break
+      }
+    }
+    if (occupied) continue
+
+    let exposed = false
+    for (let t = 0; t < threatCount; t++) {
+      if (
+        isExposedToThreat(
+          world,
+          scratch,
+          r.x,
+          r.y,
+          r.z,
+          threats[t],
+          eyeHeight,
+          shoulderOff,
+          threatEye,
+          candEye,
+        )
+      ) {
+        exposed = true
+        break
+      }
+    }
+
+    let score = -dist
+    if (!exposed) score += 40
+    if (r.hasPenthouse) score += 15
 
     if (score > bestScore) {
       bestScore = score
