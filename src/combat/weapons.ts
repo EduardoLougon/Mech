@@ -45,7 +45,7 @@ function evaluateLaser(
   world: WorldQuery,
   threats: TrackedEnemy[],
   order: MacroOrder,
-  stealth: boolean,
+  skipFarm: boolean,
 ): SlotPlan | null {
   const self = obs.self
   const muzzle = muzzlePos(self, "laser")
@@ -58,6 +58,11 @@ function evaluateLaser(
   const range = w.stats.range ?? config.weapons.laser.range ?? 280
   const damage = w.stats.damage ?? config.weapons.laser.damage ?? 315
   const minFrac = w.stats.min_frac ?? config.weapons.laser.min_frac ?? 0.35
+  const dmgPerCube =
+    typeof config.cubes.damage_per_cube === "number" ? config.cubes.damage_per_cube : 0.04
+  const statCap =
+    typeof config.cubes.stat_cap === "number" ? config.cubes.stat_cap : 10
+  const cubeMult = 1 + dmgPerCube * Math.min(self.cubes, statCap)
 
   let bestEnemy: TrackedEnemy | null = null
   let bestScore = -Infinity
@@ -69,14 +74,28 @@ function evaluateLaser(
     const d = dist3(muzzle, c)
     if (d > range) continue
 
-    const hasLOS = e.confidence >= 0.95 && world.hasShotLOS(muzzle, c)
-    // Do NOT start charging (charge === 0) without hasShotLOS
-    if (!hasLOS && charge === 0) continue
+    const rawShotLOS = world.hasShotLOS(muzzle, c)
+    const hasLOS = e.confidence >= 0.95 && rawShotLOS
 
-    let score = hasLOS ? 105 : 40 * e.confidence
+    // Allow pre-charging when within 180m with hasShotLOS (or confidence >= 0.9 and approaching)
+    const dx = self.pos[0] - e.pos[0]
+    const dy = self.pos[1] - e.pos[1]
+    const hd = Math.hypot(dx, dy)
+    const relVx = e.vel[0] - self.vel[0]
+    const relVy = e.vel[1] - self.vel[1]
+    const closingSpeed = hd > 1e-3 ? (dx * relVx + dy * relVy) / hd : 0
+    const approaching = closingSpeed > 1.5
+    const canPrecharge =
+      hasLOS ||
+      (d <= 180 && ((e.confidence >= 0.7 && rawShotLOS) || (e.confidence >= 0.9 && approaching)))
+
+    if (!canPrecharge && charge === 0) continue
+
+    const cookoffMult = e.weapons.includes("mortar") ? 1.6 : 1.0
+    let score = hasLOS ? 105 : 60 * e.confidence
     if (e.weapons.includes("mortar")) score += 60 // +60% cookoff priority
     if (e.id === order.primaryTargetId) score += 30
-    if (e.hp > 0 && e.hp <= damage) score += 25
+    if (e.hp > 0 && e.hp <= damage * cubeMult * cookoffMult) score += 25
     score -= d * 0.15
 
     if (score > bestScore) {
@@ -92,11 +111,12 @@ function evaluateLaser(
     const d = dist3(muzzle, c)
 
     if (bestLOS) {
-      const yawThresh = Math.max(0.012, Math.min(0.08, Math.atan2(1.8, d)))
-      const aligned = isAligned(self.aim, desiredAim, yawThresh, yawThresh)
+      const yawThresh = Math.max(0.014, Math.min(0.10, Math.atan2(2.2, d)))
+      const pitchThresh = Math.max(0.035, Math.min(0.18, Math.atan2(3.8, d)))
+      const aligned = isAligned(self.aim, desiredAim, yawThresh, pitchThresh)
       const frac = charge >= fullCharge ? 1 : minFrac + (1 - minFrac) * (charge / fullCharge)
       const cookoffMult = bestEnemy.weapons.includes("mortar") ? 1.6 : 1.0
-      const estDmg = damage * frac * cookoffMult
+      const estDmg = damage * cubeMult * frac * cookoffMult
       const earlyKill = charge >= minCharge && bestEnemy.hp > 0 && bestEnemy.hp <= estDmg * 0.95
       const nearAutoFire = charge >= fullCharge + holdS * 0.85
 
@@ -112,36 +132,77 @@ function evaluateLaser(
       }
     }
 
-    // Already charging while target ducked behind cover: keep holding until timeout
-    const fire = charge < fullCharge + holdS * 0.9
+    // Pre-charging approaching mech or holding charge while target ducked behind cover
+    const fire = charge === 0 ? true : charge < fullCharge + holdS * 0.9
     return {
       slot,
-      score: bestScore + 200,
+      score: bestScore + (charge > 0 ? 200 : 0),
       aim: desiredAim,
       fire,
       targetPos: c,
     }
   }
 
-  // Fallback to NPCs when farming (never in stealth)
-  if (!stealth && (order.mode === "farm_npc" || order.mode === "farm_crate")) {
+  // Fallback to visible NPCs and crates whenever no enemy mech is prioritized (unless holding fire for regen)
+  if (!skipFarm) {
+    let bestFarmAim: Vec2 | null = null
+    let bestFarmScore = -Infinity
+    let bestFarmPos: Vec3 | undefined
+    let bestFarmFire = false
+
     for (const npc of threats) {
       if (npc.kind !== "npc" || npc.confidence < 0.95) continue
       const c = targetCenter(npc.pos, "npc")
       const d = dist3(muzzle, c)
-      if (d <= range && world.hasShotLOS(muzzle, c)) {
+      if (d > range || !world.hasShotLOS(muzzle, c)) continue
+
+      const score = 48 - d * 0.1 + (charge > 0 ? 200 : 0)
+      if (score > bestFarmScore) {
         const desiredAim = solveDirectAim(muzzle, c)
-        const yawThresh = Math.max(0.012, Math.min(0.08, Math.atan2(1.5, d)))
-        const aligned = isAligned(self.aim, desiredAim, yawThresh, yawThresh)
+        const yawThresh = Math.max(0.014, Math.min(0.10, Math.atan2(1.5, d)))
+        const pitchThresh = Math.max(0.03, Math.min(0.16, Math.atan2(1.8, d)))
+        const aligned = isAligned(self.aim, desiredAim, yawThresh, pitchThresh)
+        const frac = charge >= fullCharge ? 1 : minFrac + (1 - minFrac) * (charge / fullCharge)
+        const estDmg = damage * cubeMult * frac
         const ready =
-          aligned && (charge >= fullCharge || (charge >= minCharge && npc.hp <= damage * minFrac))
-        return {
-          slot,
-          score: 35 - d * 0.1 + (charge > 0 ? 200 : 0),
-          aim: desiredAim,
-          fire: charge > 0 ? !ready : true,
-          targetPos: c,
-        }
+          aligned && (charge >= fullCharge || (charge >= minCharge && npc.hp > 0 && npc.hp <= estDmg * 0.95))
+        bestFarmScore = score
+        bestFarmAim = desiredAim
+        bestFarmPos = c
+        bestFarmFire = charge > 0 ? !ready : true
+      }
+    }
+
+    for (const crate of obs.crates) {
+      const c = targetCenter(crate.pos, "crate")
+      const d = dist3(muzzle, c)
+      if (d > range || !world.hasShotLOS(muzzle, c)) continue
+
+      const score = 26 - d * 0.1 + (charge > 0 ? 200 : 0)
+      if (score > bestFarmScore) {
+        const desiredAim = solveDirectAim(muzzle, c)
+        const yawThresh = Math.max(0.014, Math.min(0.08, Math.atan2(1.0, d)))
+        const pitchThresh = Math.max(0.025, Math.min(0.10, Math.atan2(1.0, d)))
+        const aligned = isAligned(self.aim, desiredAim, yawThresh, pitchThresh)
+        const frac = charge >= fullCharge ? 1 : minFrac + (1 - minFrac) * (charge / fullCharge)
+        const estDmg = damage * cubeMult * frac
+        const crateHp = crate.hp ?? config.crates.hp ?? 120
+        const ready =
+          aligned && (charge >= fullCharge || (charge >= minCharge && crateHp <= estDmg * 0.95))
+        bestFarmScore = score
+        bestFarmAim = desiredAim
+        bestFarmPos = c
+        bestFarmFire = charge > 0 ? !ready : true
+      }
+    }
+
+    if (bestFarmAim) {
+      return {
+        slot,
+        score: bestFarmScore,
+        aim: bestFarmAim,
+        fire: bestFarmFire,
+        targetPos: bestFarmPos,
       }
     }
   }
@@ -167,10 +228,10 @@ function evaluateLightning(
   world: WorldQuery,
   threats: TrackedEnemy[],
   order: MacroOrder,
-  stealth: boolean,
+  skipFarm: boolean,
 ): SlotPlan | null {
   const self = obs.self
-  if (w.cooldown > 0 || self.energy <= 5) return null
+  if (w.cooldown > 0 || self.energy <= 3) return null
 
   const muzzle = muzzlePos(self, "lightning")
   const range = w.stats.range ?? config.weapons.lightning.range ?? 45
@@ -181,10 +242,10 @@ function evaluateLightning(
   let bestScore = -Infinity
   let bestPos: Vec3 | undefined
 
-  // Check enemy mechs (energy > 5) and NPCs (energy > 20, not in stealth)
+  // Check enemy mechs (energy > 3) and NPCs (energy > 15, unless holding fire for regen)
   for (const e of threats) {
     if (e.confidence < 0.95) continue
-    if (e.kind === "npc" && (stealth || self.energy <= 20)) continue
+    if (e.kind === "npc" && (skipFarm || self.energy <= 15)) continue
     const c = targetCenter(e.pos, e.kind)
     const d = dist3(muzzle, c)
     if (d > range) continue
@@ -205,8 +266,8 @@ function evaluateLightning(
     }
   }
 
-  // Check crates (not in stealth, energy > 20)
-  if (!stealth && self.energy > 20) {
+  // Check crates (energy > 15, unless holding fire for regen)
+  if (!skipFarm && self.energy > 15) {
     for (const crate of obs.crates) {
       const c = targetCenter(crate.pos, "crate")
       const d = dist3(muzzle, c)
@@ -225,7 +286,8 @@ function evaluateLightning(
   if (!bestAim) return null
 
   const yawDiff = Math.abs(normalizeAngle(bestAim[0] - self.aim[0]))
-  const inCone = yawDiff <= Math.min(halfConeRad, 0.24)
+  const pitchDiff = Math.abs(bestAim[1] - self.aim[1])
+  const inCone = Math.hypot(yawDiff, pitchDiff) <= halfConeRad * 0.92
   return {
     slot,
     score: bestScore,
@@ -243,7 +305,7 @@ function evaluateMortar(
   world: WorldQuery,
   threats: TrackedEnemy[],
   order: MacroOrder,
-  stealth: boolean,
+  skipFarm: boolean,
 ): SlotPlan | null {
   if (w.cooldown > 0) return null
 
@@ -259,11 +321,8 @@ function evaluateMortar(
   let bestPos: Vec3 | undefined
 
   for (const e of threats) {
-    if (stealth) {
-      if (e.kind !== "mech" || e.confidence < 0.75) continue
-    } else if (e.confidence < 0.25) {
-      continue
-    }
+    if (e.kind === "npc" && skipFarm) continue
+    if (e.confidence < 0.25) continue
 
     const targetGround: Vec3 = [e.pos[0], e.pos[1], e.pos[2] + 0.8]
     const d = dist3(self.pos, targetGround)
@@ -296,6 +355,35 @@ function evaluateMortar(
     }
   }
 
+  if (!skipFarm) {
+    for (const crate of obs.crates) {
+      const targetGround: Vec3 = [crate.pos[0], crate.pos[1], crate.pos[2] + 0.5]
+      const d = dist3(self.pos, targetGround)
+      if (d <= 7.5 || d > 240) continue
+
+      const sol = solveMortarArc(
+        muzzle,
+        self.pos,
+        targetGround,
+        [0, 0, 0],
+        speed,
+        gravity,
+        minPitch,
+        maxPitch,
+        world,
+        false,
+      )
+      if (!sol) continue
+
+      const score = 22 - d * 0.1
+      if (score > bestScore) {
+        bestScore = score
+        bestAim = sol.aim
+        bestPos = sol.impact
+      }
+    }
+  }
+
   if (!bestAim) return null
 
   const aligned = isAligned(self.aim, bestAim, 0.04, 0.04)
@@ -316,7 +404,7 @@ function evaluateGun(
   world: WorldQuery,
   threats: TrackedEnemy[],
   order: MacroOrder,
-  stealth: boolean,
+  skipFarm: boolean,
 ): SlotPlan | null {
   const self = obs.self
   const muzzle = muzzlePos(self, "gun")
@@ -329,7 +417,7 @@ function evaluateGun(
   const closeThreat = threats.some(
     (e) => e.kind === "mech" && e.confidence >= 0.8 && dist3(e.pos, self.pos) <= 40,
   )
-  const wantReload = !reloading && ammo <= 3 && !closeThreat
+  const wantReload = !reloading && (ammo <= 0 || (ammo <= 3 && !closeThreat))
 
   if (w.cooldown > 0 || reloading || ammo <= 0) {
     return wantReload ? { slot, score: -1, aim: self.aim, fire: false, reload: true } : null
@@ -339,17 +427,14 @@ function evaluateGun(
   let bestScore = -Infinity
   let bestDist = Infinity
   let bestPos: Vec3 | undefined
+  let bestKind: "mech" | "npc" | "crate" = "mech"
 
   for (const e of threats) {
-    if (stealth) {
-      if (e.kind !== "mech" || e.confidence < 0.9) continue
-      if (dist3(muzzle, e.pos) > 105) continue
-    } else if (e.confidence < 0.85) {
-      continue
-    }
+    if (e.confidence < 0.85) continue
+    if (e.kind === "npc" && skipFarm) continue
 
     const c = targetCenter(e.pos, e.kind)
-    const sol = solveGunIntercept(muzzle, c, e.vel, speed, stealth ? Math.min(range, 105) : range, world)
+    const sol = solveGunIntercept(muzzle, c, e.vel, speed, range, world)
     if (!sol) continue
 
     const d = dist3(muzzle, sol.intercept)
@@ -362,10 +447,11 @@ function evaluateGun(
       bestAim = sol.aim
       bestDist = d
       bestPos = sol.intercept
+      bestKind = e.kind
     }
   }
 
-  if (!stealth) {
+  if (!skipFarm) {
     for (const crate of obs.crates) {
       const c = targetCenter(crate.pos, "crate")
       const sol = solveGunIntercept(muzzle, c, [0, 0, 0], speed, range, world)
@@ -378,6 +464,7 @@ function evaluateGun(
         bestAim = sol.aim
         bestDist = d
         bestPos = sol.intercept
+        bestKind = "crate"
       }
     }
   }
@@ -386,14 +473,21 @@ function evaluateGun(
     return wantReload ? { slot, score: -1, aim: self.aim, fire: false, reload: true } : null
   }
 
-  const yawThresh = Math.max(0.015, Math.min(0.1, Math.atan2(2.0, bestDist)))
-  const aligned = isAligned(self.aim, bestAim, yawThresh, yawThresh)
+  const yawThresh =
+    bestKind === "crate"
+      ? Math.max(0.015, Math.min(0.08, Math.atan2(1.0, bestDist)))
+      : Math.max(0.015, Math.min(0.12, Math.atan2(2.3, bestDist)))
+  const pitchThresh =
+    bestKind === "crate"
+      ? Math.max(0.025, Math.min(0.10, Math.atan2(1.0, bestDist)))
+      : Math.max(0.035, Math.min(0.20, Math.atan2(3.8, bestDist)))
+  const aligned = isAligned(self.aim, bestAim, yawThresh, pitchThresh)
   return {
     slot,
     score: bestScore,
     aim: bestAim,
     fire: aligned,
-    reload: wantReload,
+    reload: false,
     targetPos: bestPos,
   }
 }
@@ -406,18 +500,18 @@ function evaluateSlot(
   world: WorldQuery,
   threats: TrackedEnemy[],
   order: MacroOrder,
-  stealth: boolean,
+  skipFarm: boolean,
 ): SlotPlan | null {
   if (!w) return null
   switch (w.kind) {
     case "laser":
-      return evaluateLaser(slot, w, obs, config, world, threats, order, stealth)
+      return evaluateLaser(slot, w, obs, config, world, threats, order, skipFarm)
     case "lightning":
-      return evaluateLightning(slot, w, obs, config, world, threats, order, stealth)
+      return evaluateLightning(slot, w, obs, config, world, threats, order, skipFarm)
     case "mortar":
-      return evaluateMortar(slot, w, obs, config, world, threats, order, stealth)
+      return evaluateMortar(slot, w, obs, config, world, threats, order, skipFarm)
     case "gun":
-      return evaluateGun(slot, w, obs, config, world, threats, order, stealth)
+      return evaluateGun(slot, w, obs, config, world, threats, order, skipFarm)
     default:
       return null
   }
@@ -430,24 +524,24 @@ export function chooseWeaponAction(
   threats: ThreatState,
   order: MacroOrder,
 ): { aim: Vec2; fire: [boolean, boolean]; reload?: boolean } {
-  const stealth = order.mode === "ghost_kite" || order.preferSilent
   const muzzle = muzzlePos(obs.self)
 
-  const closeLOSEnemy = threats.enemies.some(
+  const urgentLOSEnemy = threats.enemies.some(
     (e) =>
       e.kind === "mech" &&
       e.confidence >= 0.8 &&
-      dist3(e.pos, obs.self.pos) <= 30 &&
-      world.hasShotLOS(muzzle, targetCenter(e.pos, "mech")),
+      world.hasShotLOS(muzzle, targetCenter(e.pos, "mech")) &&
+      (dist3(e.pos, obs.self.pos) <= 38 || (e.hp > 0 && e.hp <= 380)),
   )
 
-  if (order.holdFireForRegen && !closeLOSEnemy) {
+  if (order.holdFireForRegen && !urgentLOSEnemy) {
     // Check if a laser is mid-charge; only release if aligned on a valid target, else aim away/wait cleanly
-    const laserSlot = obs.self.weapons[0]?.kind === "laser" && (obs.self.weapons[0].charge ?? 0) > 0
-      ? 0
-      : obs.self.weapons[1]?.kind === "laser" && (obs.self.weapons[1].charge ?? 0) > 0
-        ? 1
-        : -1
+    const laserSlot =
+      obs.self.weapons[0]?.kind === "laser" && (obs.self.weapons[0].charge ?? 0) > 0
+        ? 0
+        : obs.self.weapons[1]?.kind === "laser" && (obs.self.weapons[1].charge ?? 0) > 0
+          ? 1
+          : -1
     if (laserSlot !== -1) {
       const lp = evaluateLaser(
         laserSlot as 0 | 1,
@@ -457,7 +551,7 @@ export function chooseWeaponAction(
         world,
         threats.enemies,
         order,
-        stealth,
+        true,
       )
       if (lp && !lp.fire) {
         const fire: [boolean, boolean] = [false, false]
@@ -470,8 +564,9 @@ export function chooseWeaponAction(
     }
   }
 
-  const p0 = evaluateSlot(0, obs.self.weapons[0], obs, config, world, threats.enemies, order, stealth)
-  const p1 = evaluateSlot(1, obs.self.weapons[1], obs, config, world, threats.enemies, order, stealth)
+  const skipFarm = order.holdFireForRegen
+  const p0 = evaluateSlot(0, obs.self.weapons[0], obs, config, world, threats.enemies, order, skipFarm)
+  const p1 = evaluateSlot(1, obs.self.weapons[1], obs, config, world, threats.enemies, order, skipFarm)
 
   const plans = [p0, p1].filter((p): p is SlotPlan => p !== null && p.score >= 0)
   const reload = Boolean(p0?.reload || p1?.reload)
@@ -489,13 +584,19 @@ export function chooseWeaponAction(
   const fire: [boolean, boolean] = [false, false]
   fire[primary.slot] = primary.fire
 
-  // Secondary weapon: allow charging laser to release cleanly or fire aligned secondary
+  // Secondary weapon: dual-weapon weaving (gun/lightning while laser charges, or clean laser release)
   if (plans.length > 1) {
     const sec = plans[1]
     const secWeapon = obs.self.weapons[sec.slot]
     if (secWeapon?.kind === "laser" && (secWeapon.charge ?? 0) > 0) {
       fire[sec.slot] = sec.fire
-    } else if (sec.fire && isAligned(obs.self.aim, sec.aim, 0.08, 0.08)) {
+    } else if (
+      (secWeapon?.kind === "gun" || secWeapon?.kind === "lightning") &&
+      sec.fire &&
+      isAligned(obs.self.aim, sec.aim, 0.10, 0.16)
+    ) {
+      fire[sec.slot] = true
+    } else if (sec.fire && isAligned(obs.self.aim, sec.aim, 0.08, 0.10)) {
       fire[sec.slot] = true
     }
   }

@@ -1,6 +1,6 @@
 import type { Config, Vec2, Vec3, WorldQuery } from "../contracts.ts"
 import { loadWorldData } from "./loader.ts"
-import { buildNavGrid, findCover, findPath } from "./nav.ts"
+import { buildNavGrid, findCover, findPath, findPeekCover } from "./nav.ts"
 import {
   createRaycastScratch,
   hasShotLOS,
@@ -44,6 +44,26 @@ export function createWorld(mapDir: string, config: Config): WorldQuery {
       eyeHeight = 8,
     ): Vec3 | null {
       return findCover(nav, world, scratch, pos, threats, radius, isSafe, eyeHeight)
+    },
+    findPeekCover(
+      pos: Vec3,
+      targetPos: Vec3,
+      otherThreats: Vec3[],
+      radius: number,
+      isSafe?: (x: number, y: number) => boolean,
+      eyeHeight = 8,
+    ): Vec3 | null {
+      return findPeekCover(
+        nav,
+        world,
+        scratch,
+        pos,
+        targetPos,
+        otherThreats,
+        radius,
+        isSafe,
+        eyeHeight,
+      )
     },
   }
 }

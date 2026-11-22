@@ -4,8 +4,13 @@ import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { performance } from "node:perf_hooks"
 import { createWorld } from "../src/world/index.ts"
-import { DEFAULT_CONFIG } from "../sim/arena_sim.ts"
-import type { Vec2, Vec3, WorldQuery } from "../src/contracts.ts"
+import { pickUpgrade } from "../src/strategy/upgrades.ts"
+import {
+  DEFAULT_CONFIG,
+  computeActiveHunterIds,
+  getHouseBotProfile,
+} from "../sim/arena_sim.ts"
+import type { Observation, Vec2, Vec3, WorldQuery } from "../src/contracts.ts"
 
 const ARENA_DIR = resolve("mechfight-kit/arena")
 
@@ -307,4 +312,233 @@ test("Performance benchmark: 1,000 WorldQuery operations stay well under 15ms/ti
     estTickP99 < 15,
     `Estimated p99 tick WorldQuery cost (${estTickP99.toFixed(2)} ms) exceeded 15 ms`
   )
+})
+
+test("WorldQuery findPeekCover returns valid peek position (or null cleanly) and stays fast", () => {
+  const world = getWorld()
+
+  // Edge cases: no other threats or zero radius return null cleanly
+  const origin: Vec3 = [250, -100, world.heightAt(250, -100)]
+  const dummyTarget: Vec3 = [280, -100, world.heightAt(280, -100)]
+  assert.equal(world.findPeekCover(origin, dummyTarget, [], 30), null)
+  assert.equal(world.findPeekCover(origin, dummyTarget, [[220, -100, world.heightAt(220, -100)]], 0), null)
+
+  // Near eastern side of a tall building (base -0.33, top 22.12, x in [301.4, 313.6], y in [-245, -236.8]):
+  // Target is visible to the east; secondary threat is on the western side behind the 22m building.
+  const pos: Vec3 = [320, -241, world.heightAt(320, -241)]
+  const targetPos: Vec3 = [350, -241, world.heightAt(350, -241)]
+  const otherThreat: Vec3 = [290, -241, world.heightAt(290, -241)]
+
+  const peek = world.findPeekCover(pos, targetPos, [otherThreat], 35)
+  assert.ok(peek !== null, "Expected findPeekCover to find a valid peek position behind tall building")
+  if (peek !== null) {
+    assert.ok(
+      Number.isFinite(peek[0]) && Number.isFinite(peek[1]) && Number.isFinite(peek[2]),
+      "Peek position coordinates should be finite"
+    )
+    const dist = Math.hypot(peek[0] - pos[0], peek[1] - pos[1])
+    assert.ok(dist <= 36, `Peek distance ${dist} exceeded search radius`)
+
+    const peekMuzzle: Vec3 = [peek[0], peek[1], peek[2] + 7]
+    const targetCenter: Vec3 = [targetPos[0], targetPos[1], targetPos[2] + 4.5]
+    assert.equal(
+      world.hasShotLOS(peekMuzzle, targetCenter),
+      true,
+      "Peek position must retain shot LOS to target"
+    )
+
+    const threatEye: Vec3 = [otherThreat[0], otherThreat[1], otherThreat[2] + 8]
+    const peekEye: Vec3 = [peek[0], peek[1], peek[2] + 8]
+    assert.equal(
+      world.hasShotLOS(threatEye, peekEye),
+      false,
+      "Peek position must block shot LOS from secondary threat"
+    )
+  }
+
+  // Speed benchmark: 100 random findPeekCover queries on real arena
+  const rng = deterministicRng(1337)
+  const worldJson = JSON.parse(readFileSync(resolve(ARENA_DIR, "v2/world.json"), "utf8")) as {
+    bounds: { minX: number; maxX: number; minY: number; maxY: number }
+  }
+  const { minX, maxX, minY, maxY } = worldJson.bounds
+  const randPt = (): Vec3 => {
+    const x = minX + (0.15 + rng() * 0.7) * (maxX - minX)
+    const y = minY + (0.15 + rng() * 0.7) * (maxY - minY)
+    return [x, y, world.heightAt(x, y)]
+  }
+
+  const peekTimes: number[] = []
+  for (let i = 0; i < 100; i++) {
+    const p = randPt()
+    const ang1 = rng() * Math.PI * 2
+    const ang2 = ang1 + Math.PI * 0.65
+    const tx = p[0] + Math.cos(ang1) * 45
+    const ty = p[1] + Math.sin(ang1) * 45
+    const ox = p[0] + Math.cos(ang2) * 55
+    const oy = p[1] + Math.sin(ang2) * 55
+    const tPos: Vec3 = [tx, ty, world.heightAt(tx, ty)]
+    const oPos: Vec3 = [ox, oy, world.heightAt(ox, oy)]
+    const t0 = performance.now()
+    const res = world.findPeekCover(p, tPos, [oPos], 28)
+    peekTimes.push(performance.now() - t0)
+    if (res !== null) {
+      assert.ok(Math.hypot(res[0] - p[0], res[1] - p[1]) <= 29)
+    }
+  }
+  peekTimes.sort((a, b) => a - b)
+  const peekP99 = percentile(peekTimes, 99)
+  assert.ok(peekP99 < 10, `findPeekCover p99 (${peekP99.toFixed(2)} ms) exceeded 10 ms`)
+})
+
+function makeUpgradeObs(
+  choiceIds: string[] | null,
+  takenUpgrades: string[] = [],
+  includeLaser = false,
+): Observation {
+  const choices =
+    choiceIds?.map((id) => {
+      const def = DEFAULT_CONFIG.upgrades.find((u) => u.id === id)
+      return {
+        id,
+        name: def?.name ?? id,
+        desc: def?.desc ?? id,
+      }
+    }) ?? null
+
+  return {
+    type: "obs",
+    tick: 100,
+    t: 5.0,
+    alive: 16,
+    self: {
+      id: 0,
+      pos: [0, 0, 0],
+      vel: [0, 0, 0],
+      aim: [0, 0],
+      hp: 1400,
+      max_hp: 1400,
+      energy: 100,
+      max_energy: 100,
+      grounded: true,
+      cubes: 3,
+      upgrades: takenUpgrades,
+      weapons: [
+        {
+          kind: "gun",
+          cooldown: 0,
+          ammo: 12,
+          reload: 0,
+          stats: { ...DEFAULT_CONFIG.weapons.gun },
+        },
+        includeLaser
+          ? {
+              kind: "laser",
+              cooldown: 0,
+              charge: 0,
+              stats: { ...DEFAULT_CONFIG.weapons.laser },
+            }
+          : null,
+      ],
+      in_zone: true,
+      stats: { ...DEFAULT_CONFIG.mech },
+    },
+    mechs: [],
+    projectiles: [],
+    crates: [],
+    cubes: [],
+    pickups: [],
+    sounds: [],
+    beams: [],
+    events: [],
+    zone: {
+      center: [41.3, -72.8],
+      radius: 560,
+      next_center: [41.3, -72.8],
+      next_radius: 380,
+      shrink_start: 60,
+      shrink_end: 110,
+      dps: 20,
+    },
+    offer: choices ? { id: 1, expires: 10.0, choices } : null,
+    drops: [],
+  }
+}
+
+test("pickUpgrade selects nanites (Repair nanites) over lower-tier upgrades", () => {
+  // No offer -> undefined
+  assert.equal(pickUpgrade(makeUpgradeObs(null), DEFAULT_CONFIG), undefined)
+
+  // nanites vs capacitor & sensors
+  const obs1 = makeUpgradeObs(["capacitor", "nanites", "sensors"])
+  assert.equal(pickUpgrade(obs1, DEFAULT_CONFIG), 1, "Should pick nanites over capacitor and sensors")
+
+  // nanites vs armor & plating
+  const obs2 = makeUpgradeObs(["armor", "plating", "nanites"])
+  assert.equal(pickUpgrade(obs2, DEFAULT_CONFIG), 2, "Should pick nanites over armor and plating")
+
+  // nanites vs held weapon upgrades (gun_rate, laser_damage)
+  const obs3 = makeUpgradeObs(["gun_rate", "laser_damage", "nanites"], [], true)
+  assert.equal(pickUpgrade(obs3, DEFAULT_CONFIG), 2, "Should pick nanites over weapon upgrades")
+
+  // Once nanites is maxed (2 stacks), fall back to armor over capacitor
+  const obsMaxed = makeUpgradeObs(["nanites", "capacitor", "armor"], ["nanites", "nanites"])
+  assert.equal(pickUpgrade(obsMaxed, DEFAULT_CONFIG), 2, "Should avoid maxed nanites and pick armor")
+})
+
+test("DEFAULT_CONFIG upgrades and 1v15 Practice hunter activation match v3 rules", () => {
+  const upgIds = new Set(DEFAULT_CONFIG.upgrades.map((u) => u.id))
+  for (const required of [
+    "nanites",
+    "armor",
+    "plating",
+    "servos",
+    "gyros",
+    "reactor",
+    "jets",
+    "sensors",
+    "capacitor",
+    "gun_damage",
+    "gun_rate",
+    "gun_velocity",
+    "gun_mag",
+    "laser_charge",
+    "laser_damage",
+    "laser_pierce",
+    "lightning_chain",
+    "lightning_range",
+    "lightning_efficiency",
+    "mortar_splash",
+    "mortar_reload",
+    "mortar_velocity",
+  ]) {
+    assert.ok(upgIds.has(required), `Missing real upgrade id: ${required}`)
+  }
+
+  // Tier assignment: 4 easy (1-4), 4 medium (5-8), 4 hard (9-12), 3 expert (13-15)
+  assert.equal(getHouseBotProfile(1).tier, "easy")
+  assert.equal(getHouseBotProfile(4).tier, "easy")
+  assert.equal(getHouseBotProfile(5).tier, "medium")
+  assert.equal(getHouseBotProfile(8).tier, "medium")
+  assert.equal(getHouseBotProfile(9).tier, "hard")
+  assert.equal(getHouseBotProfile(12).tier, "hard")
+  assert.equal(getHouseBotProfile(13).tier, "expert")
+  assert.equal(getHouseBotProfile(15).tier, "expert")
+
+  const all15 = Array.from({ length: 15 }, (_, i) => i + 1)
+
+  // Early game: killedCount === 0 && t < 35 -> only 1 easy bot (id 1) hunts
+  const early = computeActiveHunterIds(all15, 0, 10, 560)
+  assert.deepEqual([...early], [1])
+
+  // Mid game progression: killed 4 (ids 1-4 dead), t = 90 -> 1 + floor(3.2) + floor(2) = 6 hunters (ids 5-10)
+  const midAlive = all15.slice(4)
+  const mid = computeActiveHunterIds(midAlive, 4, 90, 380)
+  assert.deepEqual([...mid], [5, 6, 7, 8, 9, 10])
+
+  // Late game: t >= 180 or zoneRadius <= 140 -> all remaining bots hunt
+  const lateTime = computeActiveHunterIds(midAlive, 4, 180, 240)
+  assert.deepEqual([...lateTime], midAlive)
+  const lateZone = computeActiveHunterIds(midAlive, 4, 100, 140)
+  assert.deepEqual([...lateZone], midAlive)
 })

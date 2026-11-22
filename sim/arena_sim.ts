@@ -178,7 +178,7 @@ export const DEFAULT_CONFIG: Config = {
     { id: "jets", name: "Efficient jets", desc: "-25% boost and jet energy drain", max: 2, effects: [{ path: "mech.boost_drain", mul: 0.75 }, { path: "mech.jet_drain", mul: 0.75 }] },
     { id: "nanites", name: "Repair nanites", desc: "+60% out-of-combat regen, starts 1.5 s sooner", max: 2, effects: [{ path: "mech.regen_per_s", mul: 1.6 }, { path: "mech.regen_delay", add: -1.5 }] },
     { id: "gyros", name: "Torso gyros", desc: "+30% aim turn rate", max: 2, effects: [{ path: "mech.turn_rate", mul: 1.3 }, { path: "mech.pitch_rate", mul: 1.3 }] },
-    { id: "sensors", name: "Sensor suite", desc: "+15 m proximity sensors, +25 m vision", max: 2, effects: [{ path: "mech.near_range_bonus", add: 15 }, { path: "mech.vision_bonus", add: 25 }, { path: "mech.hearing", mul: 0.5 }] },
+    { id: "sensors", name: "Sensor suite", desc: "+15 m proximity sensors, +25 m vision, halves sound bearing error", max: 2, effects: [{ path: "mech.near_range_bonus", add: 15 }, { path: "mech.vision_bonus", add: 25 }, { path: "mech.hearing", mul: 0.5 }] },
     { id: "gun_damage", name: "Tungsten rounds", desc: "+15% arm gun damage", requires: "gun", max: 3, effects: [{ path: "weapons.gun.damage", mul: 1.15 }] },
     { id: "gun_rate", name: "Rotary feed", desc: "+15% arm gun fire rate", requires: "gun", max: 3, effects: [{ path: "weapons.gun.cooldown", mul: 0.87 }] },
     { id: "gun_velocity", name: "Rail barrel", desc: "+25% arm gun projectile speed", requires: "gun", max: 2, effects: [{ path: "weapons.gun.speed", mul: 1.25 }, { path: "weapons.gun.range", mul: 1.15 }] },
@@ -712,15 +712,164 @@ class ExternalBotClient {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in House Bot AI (baseline opponent for 1v15)
+// Built-in House Bot AI (tiered 1v15 Practice opponents & FFA baseline)
 // ---------------------------------------------------------------------------
 
-function houseBotAct(obs: Observation, rng: Rng, isSquad1v15 = false): Action {
+export type HouseBotTier = "easy" | "medium" | "hard" | "expert"
+
+export interface HouseBotProfile {
+  tier: HouseBotTier
+  aimJitterRad: number
+  leadFactor: number
+  fireChance: number
+  desiredDist: number
+  strafeWeight: number
+  boostAggression: boolean
+  engageRange: number
+  smartUpgrades: boolean
+}
+
+export function getHouseBotProfile(id: number): HouseBotProfile {
+  if (id >= 1 && id <= 4) {
+    return {
+      tier: "easy",
+      aimJitterRad: 0.14,
+      leadFactor: 0.15,
+      fireChance: 0.55,
+      desiredDist: 65,
+      strafeWeight: 0.35,
+      boostAggression: false,
+      engageRange: 145,
+      smartUpgrades: false,
+    }
+  }
+  if (id >= 5 && id <= 8) {
+    return {
+      tier: "medium",
+      aimJitterRad: 0.08,
+      leadFactor: 0.5,
+      fireChance: 0.78,
+      desiredDist: 55,
+      strafeWeight: 0.55,
+      boostAggression: false,
+      engageRange: 190,
+      smartUpgrades: false,
+    }
+  }
+  if (id >= 9 && id <= 12) {
+    return {
+      tier: "hard",
+      aimJitterRad: 0.04,
+      leadFactor: 0.8,
+      fireChance: 0.92,
+      desiredDist: 45,
+      strafeWeight: 0.7,
+      boostAggression: true,
+      engageRange: 230,
+      smartUpgrades: true,
+    }
+  }
+  if (id >= 13 && id <= 15) {
+    return {
+      tier: "expert",
+      aimJitterRad: 0.018,
+      leadFactor: 0.95,
+      fireChance: 1.0,
+      desiredDist: 40,
+      strafeWeight: 0.85,
+      boostAggression: true,
+      engageRange: 260,
+      smartUpgrades: true,
+    }
+  }
+  return {
+    tier: "medium",
+    aimJitterRad: 0.07,
+    leadFactor: 0.5,
+    fireChance: 0.8,
+    desiredDist: 50,
+    strafeWeight: 0.6,
+    boostAggression: false,
+    engageRange: 200,
+    smartUpgrades: false,
+  }
+}
+
+/**
+ * Practice 1v15 weakest-first hunter activation:
+ * - Early on (killedCount === 0 && t < 35): only 1 easy bot actively hunts.
+ * - Progression: maxActiveHunters = Math.min(15, 1 + Math.floor(killedCount * 0.8) + Math.floor(t / 45)),
+ *   activating weakest-first (lowest alive bot id first).
+ * - Late game (t >= 180 or zoneRadius <= 140): all remaining alive house bots hunt.
+ */
+export function computeActiveHunterIds(
+  aliveHouseIds: number[],
+  killedCount: number,
+  t: number,
+  zoneRadius: number,
+): Set<number> {
+  const sorted = [...aliveHouseIds].sort((a, b) => a - b)
+  if (sorted.length === 0) return new Set()
+  if (t >= 180 || zoneRadius <= 140) {
+    return new Set(sorted)
+  }
+  const maxActiveHunters =
+    killedCount === 0 && t < 35
+      ? 1
+      : Math.min(15, 1 + Math.floor(killedCount * 0.8) + Math.floor(t / 45))
+  return new Set(sorted.slice(0, maxActiveHunters))
+}
+
+interface HouseBotContext {
+  isSquad1v15: boolean
+  activeHunter: boolean
+  playerPos: Vec3 | null
+  world?: SimWorld
+}
+
+const HOUSE_UPGRADE_PREF = [
+  "nanites",
+  "armor",
+  "plating",
+  "servos",
+  "laser_charge",
+  "laser_damage",
+  "lightning_efficiency",
+  "gun_rate",
+  "gun_damage",
+  "gyros",
+  "reactor",
+  "sensors",
+]
+
+function solveHouseMortarPitch(d: number, dz: number, speed: number, gravity: number): number | null {
+  if (d < 1) return null
+  const v2 = speed * speed
+  const disc = v2 * v2 - gravity * (gravity * d * d + 2 * dz * v2)
+  if (disc < 0) return null
+  return Math.atan((v2 - Math.sqrt(disc)) / (gravity * d))
+}
+
+function houseBotAct(obs: Observation, rng: Rng, ctx: HouseBotContext): Action {
   const me = obs.self
   const act: Action = { tick: obs.tick }
+  const profile = ctx.isSquad1v15 ? getHouseBotProfile(me.id) : getHouseBotProfile(0)
 
-  if (obs.offer) {
-    act.pick = 0
+  if (obs.offer && obs.offer.choices.length > 0) {
+    if (profile.smartUpgrades) {
+      let bestIdx = 0
+      let bestRank = Infinity
+      for (let i = 0; i < obs.offer.choices.length; i++) {
+        const rank = HOUSE_UPGRADE_PREF.indexOf(obs.offer.choices[i].id)
+        if (rank >= 0 && rank < bestRank) {
+          bestRank = rank
+          bestIdx = i
+        }
+      }
+      act.pick = bestIdx
+    } else {
+      act.pick = 0
+    }
   }
 
   // Pick up nearby weapon if slot 1 is empty
@@ -743,70 +892,127 @@ function houseBotAct(obs: Observation, rng: Rng, isSquad1v15 = false): Action {
     }
   }
 
+  // In 1v15 squad mode, inactive bots patrol/stay in zone unless the player walks within 60m.
+  const playerDist = ctx.playerPos ? dist2(me.pos, ctx.playerPos) : Infinity
+  const canHuntPlayer = !ctx.isSquad1v15 || ctx.activeHunter || playerDist <= 60
+
   // In 1v15 squad mode, house bots ONLY target slot 0 (player), never each other.
   // In FFA mode, target nearest visible enemy mech (or NPC).
-  const enemies = isSquad1v15
-    ? obs.mechs.filter((m) => m.kind === "mech" && m.id === 0)
+  const enemies = ctx.isSquad1v15
+    ? canHuntPlayer
+      ? obs.mechs.filter((m) => m.kind === "mech" && m.id === 0)
+      : []
     : obs.mechs.filter((m) => m.kind === "mech")
-  let target = enemies[0] ?? (isSquad1v15 ? null : obs.mechs[0] ?? null)
-  if (!isSquad1v15 && enemies.length > 1) {
+  let target = enemies[0] ?? (ctx.isSquad1v15 ? null : obs.mechs[0] ?? null)
+  if (!ctx.isSquad1v15 && enemies.length > 1) {
     target = enemies.reduce((best, cur) =>
       dist3(me.pos, cur.pos) < dist3(me.pos, best.pos) ? cur : best
     )
   }
 
-  if (target) {
-    const dx = target.pos[0] - me.pos[0]
-    const dy = target.pos[1] - me.pos[1]
-    const horiz = Math.hypot(dx, dy) || 1
-    const dz = (target.pos[2] + 4.5) - (me.pos[2] + 7)
-    const yaw = Math.atan2(dy, dx)
-    const pitch = Math.atan2(dz, horiz)
-    act.aim = [yaw, pitch]
+  if (target && canHuntPlayer) {
+    const rawDx = target.pos[0] - me.pos[0]
+    const rawDy = target.pos[1] - me.pos[1]
+    const horiz = Math.hypot(rawDx, rawDy) || 1
 
-    // Early game in 1v15: 1-3 bots converge aggressively, others converge later or when close
-    const squadConverge = !isSquad1v15 || obs.t >= 40 || obs.zone.radius < 380 || me.id <= 3 || horiz < 130
+    // Tier-based target leading for gun/projectiles
+    const gunSpeed = me.weapons[0]?.kind === "gun" ? (me.weapons[0].stats.speed ?? 252) : 252
+    const leadT = Math.min(1.0, horiz / gunSpeed) * profile.leadFactor
+    const aimX = target.pos[0] + target.vel[0] * leadT
+    const aimY = target.pos[1] + target.vel[1] * leadT
+    const aimZ = target.pos[2] + 4.5 + target.vel[2] * leadT * 0.5
+
+    const dx = aimX - me.pos[0]
+    const dy = aimY - me.pos[1]
+    const aimHoriz = Math.hypot(dx, dy) || 1
+    const dz = aimZ - (me.pos[2] + (me.stats.muzzle_height ?? 7))
+
+    let yaw = Math.atan2(dy, dx) + rng.gaussian() * profile.aimJitterRad
+    let pitch = Math.atan2(dz, aimHoriz) + rng.gaussian() * profile.aimJitterRad * 0.5
+
+    const muzzle: Vec3 = [me.pos[0], me.pos[1], me.pos[2] + (me.stats.muzzle_height ?? 7)]
+    const targetCenter: Vec3 = [target.pos[0], target.pos[1], target.pos[2] + 4.5]
+    const hasLOS = ctx.world ? ctx.world.hasShotLOS(muzzle, targetCenter) : true
 
     const fire: [boolean, boolean] = [false, false]
-    if (horiz < 250) {
+    if (horiz < profile.engageRange) {
       for (let s = 0; s < 2; s++) {
         const w = me.weapons[s]
         if (!w) continue
-        if (w.kind === "gun" && (w.ammo ?? 0) > 0 && w.cooldown <= 0 && horiz < 210) fire[s] = true
-        if (w.kind === "lightning" && horiz < 42 && me.energy > 15 && w.cooldown <= 0) fire[s] = true
-        if (w.kind === "laser" && horiz < 250 && w.cooldown <= 0) {
-          fire[s] = (w.charge ?? 0) < 0.7
+        if (w.kind === "gun" && (w.ammo ?? 0) > 0 && w.cooldown <= 0 && horiz < Math.min(210, profile.engageRange) && hasLOS) {
+          if (rng.next() < profile.fireChance) fire[s] = true
+        } else if (w.kind === "lightning" && horiz < 42 && me.energy > 15 && w.cooldown <= 0 && hasLOS) {
+          if (rng.next() < profile.fireChance) fire[s] = true
+        } else if (w.kind === "laser" && horiz < Math.min(250, profile.engageRange) && w.cooldown <= 0 && hasLOS) {
+          const ch = w.charge ?? 0
+          if (ch > 0) {
+            fire[s] = ch < 0.72
+          } else if (rng.next() < profile.fireChance) {
+            fire[s] = true
+          }
+        } else if (w.kind === "mortar" && horiz > 20 && horiz < Math.min(210, profile.engageRange) && w.cooldown <= 0) {
+          const allowBlindLob = profile.tier === "hard" || profile.tier === "expert"
+          if ((hasLOS || allowBlindLob) && rng.next() < profile.fireChance) {
+            const mPitch = solveHouseMortarPitch(
+              aimHoriz,
+              target.pos[2] - (me.pos[2] + (me.stats.height ?? 9) + 0.5),
+              w.stats.speed ?? 72,
+              w.stats.gravity ?? 22,
+            )
+            if (mPitch !== null) {
+              pitch = mPitch + rng.gaussian() * profile.aimJitterRad * 0.5
+              fire[s] = true
+            }
+          }
         }
-        if (w.kind === "mortar" && horiz > 20 && horiz < 210 && w.cooldown <= 0) fire[s] = true
       }
     }
+
+    act.aim = [wrapAngle(yaw), clamp(pitch, -0.7, 1.3)]
     act.fire = fire
 
-    if (!act.move && squadConverge) {
-      const strafe = (obs.tick % 40) < 20 ? 1 : -1
-      const desiredDist = 45
-      const radial = horiz > desiredDist ? 0.75 : -0.45
-      const nx = dx / horiz, ny = dy / horiz
-      const mx = nx * radial - ny * 0.65 * strafe
-      const my = ny * radial + nx * 0.65 * strafe
+    if (!act.move) {
+      const strafePeriod = profile.tier === "expert" ? 24 : profile.tier === "hard" ? 32 : 44
+      const strafe = ((obs.tick + me.id * 7) % strafePeriod) < strafePeriod / 2 ? 1 : -1
+      const radial = horiz > profile.desiredDist ? 0.78 : horiz < profile.desiredDist * 0.65 ? -0.45 : 0.05
+      const nx = rawDx / horiz, ny = rawDy / horiz
+      const mx = nx * radial - ny * profile.strafeWeight * strafe
+      const my = ny * radial + nx * profile.strafeWeight * strafe
       const mlen = Math.hypot(mx, my) || 1
       act.move = [mx / mlen, my / mlen]
-      act.boost = !me.in_zone || horiz > 120
+      act.boost = !me.in_zone || (profile.boostAggression ? horiz > 95 : horiz > 140)
+    }
+  } else if (ctx.isSquad1v15 && ctx.activeHunter && ctx.playerPos) {
+    // Active hunter without current LOS navigates toward the player while respecting zone safety
+    const zx = obs.zone.next_center[0] - me.pos[0]
+    const zy = obs.zone.next_center[1] - me.pos[1]
+    const zdist = Math.hypot(zx, zy)
+    if (!me.in_zone) {
+      const len = zdist || 1
+      act.move = [zx / len, zy / len]
+      act.boost = true
+    } else if (!act.move) {
+      const hx = ctx.playerPos[0] - me.pos[0]
+      const hy = ctx.playerPos[1] - me.pos[1]
+      const hlen = Math.hypot(hx, hy) || 1
+      act.move = [hx / hlen, hy / hlen]
+      act.boost = profile.boostAggression && hlen > 80 && me.energy > 35
+      act.aim = [Math.atan2(hy, hx), 0]
     }
   }
 
   if (!act.move) {
-    // Move toward zone center with mild wander
+    // Inactive bots (or FFA with no target): patrol gently and stay inside the zone
     const zx = obs.zone.next_center[0] - me.pos[0]
     const zy = obs.zone.next_center[1] - me.pos[1]
     const zdist = Math.hypot(zx, zy)
-    if (!me.in_zone || zdist > obs.zone.radius * 0.6) {
+    if (!me.in_zone || zdist > obs.zone.radius * 0.65) {
       const len = zdist || 1
       act.move = [zx / len, zy / len]
       act.boost = !me.in_zone
     } else {
-      const ang = ((obs.tick * 0.05 + me.id * 1.7) % (Math.PI * 2))
-      act.move = [Math.cos(ang) * 0.6, Math.sin(ang) * 0.6]
+      const ang = (obs.tick * 0.04 + me.id * 1.7) % (Math.PI * 2)
+      act.move = [Math.cos(ang) * 0.55, Math.sin(ang) * 0.55]
     }
     if (!act.aim) {
       act.aim = [wrapAngle(me.aim[0] + (rng.next() - 0.5) * 0.4), 0]
@@ -993,8 +1199,24 @@ export class ArenaMatch {
     return [x, y, this.world.heightAt(x, y)]
   }
 
-  private makeWeapon(kind: WeaponKind): WeaponState {
+  private makeWeapon(kind: WeaponKind, upgradeCounts?: Map<string, number>): WeaponState {
     const stats = { ...this.cfg.weapons[kind] }
+    if (upgradeCounts) {
+      for (const [upgId, stacks] of upgradeCounts) {
+        if (stacks <= 0) continue
+        const def = this.cfg.upgrades.find((u) => u.id === upgId)
+        if (!def) continue
+        for (let s = 0; s < stacks; s++) {
+          for (const eff of def.effects) {
+            const [scope, sub, key] = eff.path.split(".")
+            if (scope === "weapons" && sub === kind && key) {
+              const cur = stats[key] ?? 0
+              stats[key] = eff.mul !== undefined ? cur * eff.mul : cur + (eff.add ?? 0)
+            }
+          }
+        }
+      }
+    }
     return {
       kind,
       cooldown: 0,
@@ -1158,7 +1380,7 @@ export class ArenaMatch {
     }
   }
 
-  private buildObs(m: MechState): Observation {
+  private buildObs(m: MechState, activeHunterIds?: Set<number>): Observation {
     const mechsObs: ActorObs[] = []
     for (const other of this.mechs) {
       if (!other.alive || other.id === m.id) continue
@@ -1170,7 +1392,9 @@ export class ArenaMatch {
           this.squadKnownUntilT = Math.max(this.squadKnownUntilT, this.t + (this.cfg.vision.memory_s ?? 5))
         }
       }
-      const squadShared = this.mode === "1v15" && m.id > 0 && other.id === 0 && this.squadKnownUntilT >= this.t
+      const isActiveHunter = !activeHunterIds || activeHunterIds.has(m.id)
+      const squadShared =
+        this.mode === "1v15" && m.id > 0 && other.id === 0 && isActiveHunter && this.squadKnownUntilT >= this.t
       const memExp = m.memory.get(other.id) ?? -1
       if (vis || memExp >= this.t || squadShared) {
         mechsObs.push({
@@ -1967,7 +2191,7 @@ export class ArenaMatch {
               this.pickups.push({ id: dropId, kind: old.kind, pos: [...m.pos] as Vec3, ammo: old.ammo, cooldown: old.cooldown, alive: true })
               m.events.push({ type: "dropped", id: dropId, kind: old.kind, slot })
             }
-            const nw = this.makeWeapon(p.kind)
+            const nw = this.makeWeapon(p.kind, m.upgradeCounts)
             nw.cooldown = Math.max(this.cfg.loot.equip_s, p.cooldown)
             if (p.kind === "gun" && p.ammo > 0) nw.ammo = p.ammo
             m.weapons[slot] = nw
@@ -1993,9 +2217,18 @@ export class ArenaMatch {
     while (this.aliveCount > 1 && this.tick < maxTicks && (this.mode !== "1v15" || this.mechs[0].alive)) {
       if (this.tick % decideEvery === 0) {
         const aliveMechs = this.mechs.filter((m) => m.alive)
+        let activeHunterIds: Set<number> | undefined
+        let playerPos: Vec3 | null = null
+        if (this.mode === "1v15") {
+          const aliveHouseIds = aliveMechs.filter((m) => m.id > 0).map((m) => m.id)
+          const killedCount = (this.cfg.match.mechs - 1) - aliveHouseIds.length
+          activeHunterIds = computeActiveHunterIds(aliveHouseIds, killedCount, this.t, this.zoneRadius)
+          playerPos = this.mechs[0]?.alive ? this.mechs[0].pos : null
+        }
+
         await Promise.all(
           aliveMechs.map(async (m) => {
-            const obs = this.buildObs(m)
+            const obs = this.buildObs(m, activeHunterIds)
             if (m.client) {
               const { action, latencyMs } = await m.client.decide(obs, Math.max(200, this.cfg.bot.tick_budget_ms * 4))
               if (targetSlots.has(m.id)) this.targetLatenciesMs.push(latencyMs)
@@ -2010,7 +2243,13 @@ export class ArenaMatch {
                 }
               }
             } else {
-              const act = houseBotAct(obs, this.rng, this.mode === "1v15" && m.id > 0)
+              const isSquad1v15 = this.mode === "1v15" && m.id > 0
+              const act = houseBotAct(obs, this.rng, {
+                isSquad1v15,
+                activeHunter: isSquad1v15 ? Boolean(activeHunterIds?.has(m.id)) : true,
+                playerPos,
+                world: this.world,
+              })
               m.lastAction = act
               this.applyOneShotAction(m, act)
             }

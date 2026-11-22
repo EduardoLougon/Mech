@@ -31,6 +31,15 @@ export interface WorldQuery {
     isSafe?: (x: number, y: number) => boolean,
     eyeHeight?: number,
   ): Vec3 | null
+  /** Find a "slice-the-pie" corner cell within `radius` that HAS shot LOS to `targetPos` while blocking shot LOS from `otherThreats`. */
+  findPeekCover(
+    pos: Vec3,
+    targetPos: Vec3,
+    otherThreats: Vec3[],
+    radius: number,
+    isSafe?: (x: number, y: number) => boolean,
+    eyeHeight?: number,
+  ): Vec3 | null
 }
 
 export interface TrackedEnemy {

@@ -2,18 +2,17 @@ import type {
   Config,
   MacroOrder,
   Observation,
+  ThreatState,
   TrackedEnemy,
   Vec2,
   Vec3,
   WeaponKind,
   WorldQuery,
-  ThreatState,
 } from "../contracts.ts"
 import { pickUpgrade } from "./upgrades.ts"
 import { clampToSafeZone, evaluateZone, isPointInSafeZone } from "./zone.ts"
 
-const PRACTICE_LOADOUT: WeaponKind[] = ["laser", "lightning", "gun", "mortar"]
-const FFA_LOADOUT: WeaponKind[] = ["laser", "lightning", "mortar", "gun"]
+const DESIRED_LOADOUT: WeaponKind[] = ["laser", "lightning", "gun", "mortar"]
 
 const COMBAT_SOUND_KINDS = new Set([
   "gun",
@@ -25,17 +24,10 @@ const COMBAT_SOUND_KINDS = new Set([
   "lightning",
 ])
 
+const MOVEMENT_SOUND_KINDS = new Set(["step", "boost", "jet"])
+
 function dist2D(a: Vec2 | Vec3, b: Vec2 | Vec3): number {
   return Math.hypot(a[0] - b[0], a[1] - b[1])
-}
-
-function hasEnemyWithin(enemies: TrackedEnemy[], pos: Vec3, radius: number): boolean {
-  for (const e of enemies) {
-    if (e.kind === "mech" && dist2D(e.pos, pos) <= radius) {
-      return true
-    }
-  }
-  return false
 }
 
 function countMechsNear(enemies: TrackedEnemy[], pos: Vec3, radius: number): number {
@@ -56,12 +48,50 @@ function getHeldWeaponKinds(obs: Observation): Set<WeaponKind> {
   return held
 }
 
+function hasMechShotLOS(
+  obs: Observation,
+  world: WorldQuery,
+  enemyPos: Vec3,
+  eyeHeight: number,
+): boolean {
+  const selfEye: Vec3 = [obs.self.pos[0], obs.self.pos[1], obs.self.pos[2] + eyeHeight]
+  const targetMid: Vec3 = [enemyPos[0], enemyPos[1], enemyPos[2] + 4.5]
+  return world.hasShotLOS(selfEye, targetMid)
+}
+
+function findKillConfirmTarget(
+  obs: Observation,
+  threats: ThreatState,
+  world: WorldQuery,
+  eyeHeight: number,
+): TrackedEnemy | null {
+  if (obs.self.hp <= 220) return null
+
+  let best: TrackedEnemy | null = null
+  let bestScore = -Infinity
+
+  for (const e of threats.enemies) {
+    if (e.kind !== "mech") continue
+    if (e.confidence < 0.9) continue
+    if (e.hp <= 0 || e.hp > 380) continue
+    if (!hasMechShotLOS(obs, world, e.pos, eyeHeight)) continue
+
+    const d = dist2D(obs.self.pos, e.pos)
+    const score = (380 - e.hp) * 1.2 - d * 0.5
+    if (score > bestScore) {
+      bestScore = score
+      best = e
+    }
+  }
+
+  return best
+}
+
 function findDesiredPickup(
   obs: Observation,
   desiredLoadout: WeaponKind[],
   maxDist: number,
   enemies: TrackedEnemy[],
-  avoidEnemiesRadius: number,
 ): Vec3 | null {
   const held = getHeldWeaponKinds(obs)
   const hasEmptySlot = obs.self.weapons.some((w) => w === null)
@@ -81,15 +111,19 @@ function findDesiredPickup(
     if (held.has(p.kind)) continue
     const rank = desiredLoadout.indexOf(p.kind)
     if (rank === -1) continue
-    if (!hasEmptySlot && rank >= worstHeldRank) continue
+
+    if (!hasEmptySlot) {
+      const isTopTierUpgrade = p.kind === "laser" || p.kind === "lightning"
+      if (!isTopTierUpgrade || rank >= worstHeldRank) continue
+    }
+
     if (!isPointInSafeZone(p.pos, obs, 6)) continue
 
     const d = dist2D(obs.self.pos, p.pos)
     if (d > maxDist) continue
-    if (avoidEnemiesRadius > 0 && hasEnemyWithin(enemies, p.pos, avoidEnemiesRadius)) continue
+    if (countMechsNear(enemies, p.pos, 25) >= 2) continue
 
-    // Higher priority weapon + closer distance
-    const score = (desiredLoadout.length - rank) * 25 - d
+    const score = (desiredLoadout.length - rank) * 28 - d
     if (score > bestScore) {
       bestScore = score
       bestPos = p.pos
@@ -102,7 +136,8 @@ function findDesiredPickup(
 function pickBestMechTarget(
   obs: Observation,
   threats: ThreatState,
-  isPractice: boolean,
+  world: WorldQuery,
+  eyeHeight: number,
 ): TrackedEnemy | null {
   let best: TrackedEnemy | null = null
   let bestScore = -Infinity
@@ -112,10 +147,13 @@ function pickBestMechTarget(
     const d = dist2D(obs.self.pos, e.pos)
     const hpRatio = e.hp / Math.max(1, e.maxHp)
 
-    // Prioritize visible/recent, wounded, and closer targets
-    let score = e.confidence * 50 + (1 - hpRatio) * 65 - d * 0.45
-    if (e.charging) score += 15
-    if (isPractice && d > 180) score -= 30
+    // Heavily favor low HP + high confidence + close range
+    let score = (1 - hpRatio) * 115 + e.confidence * 70 - d * 0.55
+    if (e.hp > 0 && e.hp <= 380) score += 55
+    if (e.charging) score += 18
+    if (e.confidence >= 0.9 && hasMechShotLOS(obs, world, e.pos, eyeHeight)) {
+      score += 22
+    }
 
     if (score > bestScore) {
       bestScore = score
@@ -144,17 +182,36 @@ function getStandoffPoint(
   return clampToSafeZone(tx, ty, obs, world)
 }
 
-function getPreferredCombatRange(held: Set<WeaponKind>): number {
-  if (held.has("lightning")) return 28
-  if (held.has("laser")) return 68
-  if (held.has("mortar")) return 62
-  return 40
+function getOrbitalStrafePoint(
+  obs: Observation,
+  targetPos: Vec3,
+  optRange: number,
+  world: WorldQuery,
+): Vec3 {
+  const me = obs.self.pos
+  const rx = me[0] - targetPos[0]
+  const ry = me[1] - targetPos[1]
+  const d = Math.hypot(rx, ry)
+
+  const ux = d > 1e-3 ? rx / d : 1
+  const uy = d > 1e-3 ? ry / d : 0
+
+  // Flip tangent direction every 1.6s to break projectile lead prediction
+  const dir = Math.floor(obs.t / 1.6) % 2 === 0 ? 1 : -1
+  const tangX = -uy * dir
+  const tangY = ux * dir
+  const strafeStep = 14
+
+  const desiredX = targetPos[0] + ux * optRange + tangX * strafeStep
+  const desiredY = targetPos[1] + uy * optRange + tangY * strafeStep
+  return clampToSafeZone(desiredX, desiredY, obs, world)
 }
 
 function findRetreatTarget(
   obs: Observation,
   threats: ThreatState,
   world: WorldQuery,
+  eyeHeight: number,
 ): Vec3 {
   const enemyPositions = threats.enemies.map((e) => e.pos)
   if (enemyPositions.length > 0) {
@@ -163,14 +220,13 @@ function findRetreatTarget(
       enemyPositions,
       36,
       (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
-      obs.self.stats.eye_height ?? 8,
+      eyeHeight,
     )
     if (cover) {
       return cover
     }
   }
 
-  // Fallback: move directly away from nearest threat, clamped to safe zone
   let nearest: TrackedEnemy | null = null
   let nearestDist = Infinity
   for (const e of threats.enemies) {
@@ -193,33 +249,35 @@ function findRetreatTarget(
   return [ncx, ncy, world.surfaceZAt(ncx, ncy, obs.self.pos[2])]
 }
 
-function findSoundInvestigatePoint(
-  obs: Observation,
-  world: WorldQuery,
-): Vec3 | null {
+function findSoundInvestigatePoint(obs: Observation, world: WorldQuery): Vec3 | null {
   let bestBearing: number | null = null
+  let bestDistStep = 48
   let bestScore = -Infinity
 
   for (const s of obs.sounds) {
-    if (!COMBAT_SOUND_KINDS.has(s.kind)) continue
+    const isCombat = COMBAT_SOUND_KINDS.has(s.kind)
+    const isMove = MOVEMENT_SOUND_KINDS.has(s.kind)
+    if (!isCombat && !isMove) continue
     if (s.age > 3.5) continue
-    if (s.dist === "far") continue
+    if (!isCombat && s.dist === "far") continue
 
-    let score = s.dist === "near" ? 40 : 25
-    if (s.kind === "death") score += 20
-    else if (s.kind === "laser" || s.kind === "gun") score += 10
+    let score = s.dist === "near" ? 45 : s.dist === "mid" ? 28 : 12
+    if (s.kind === "death") score += 22
+    else if (s.kind === "laser" || s.kind === "gun" || s.kind === "lightning") score += 12
+    else if (!isCombat) score -= 12
     score -= s.age * 6
 
     if (score > bestScore) {
       bestScore = score
       bestBearing = s.bearing
+      bestDistStep = s.dist === "far" ? 72 : s.dist === "mid" ? 56 : 36
     }
   }
 
   if (bestBearing === null) return null
 
-  const tx = obs.self.pos[0] + Math.cos(bestBearing) * 48
-  const ty = obs.self.pos[1] + Math.sin(bestBearing) * 48
+  const tx = obs.self.pos[0] + Math.cos(bestBearing) * bestDistStep
+  const ty = obs.self.pos[1] + Math.sin(bestBearing) * bestDistStep
   return clampToSafeZone(tx, ty, obs, world)
 }
 
@@ -232,33 +290,33 @@ export interface Strategy {
 }
 
 /**
- * Create the dual-mode macro strategy engine (1v15 Practice + 16-mech FFA).
+ * Create the v3 "Apex Wave-Slayer & FFA Snowball" macro strategy engine.
  */
 export function createStrategy(config: Config): Strategy {
   let inRegenHide = false
+  let patrolAngle: number | null = null
 
   return {
     decide(obs: Observation, world: WorldQuery, threats: ThreatState) {
       const pick = pickUpgrade(obs, config)
-      const isPractice = threats.ffaConfidence < 0.45
-      const desiredLoadout = isPractice ? PRACTICE_LOADOUT : FFA_LOADOUT
+      const desiredLoadout = DESIRED_LOADOUT
       const held = getHeldWeaponKinds(obs)
+      const eyeHeight = obs.self.stats.eye_height ?? 8
       const zoneAdvice = evaluateZone(obs, world, config)
-      const practicePreferSilent =
-        threats.spottedByCount === 0 && !hasEnemyWithin(threats.enemies, obs.self.pos, 50)
+      const hpRatio = obs.self.hp / Math.max(1, obs.self.max_hp)
 
-      // 1. Zone Override: avoid zone damage (ignores armor and resets 5s HP regen)
+      // Priority 1 — Safe Zone (zone_sprint): avoid zone damage (ignores armor & resets regen)
       if (zoneAdvice.mustSprint) {
         if (!obs.self.in_zone) {
           inRegenHide = false
         }
-        const nearestMech = pickBestMechTarget(obs, threats, isPractice)
+        const bestMech = pickBestMechTarget(obs, threats, world, eyeHeight)
         return {
           pick,
           order: {
             mode: "zone_sprint",
             moveTarget: zoneAdvice.moveTarget,
-            primaryTargetId: nearestMech?.id ?? null,
+            primaryTargetId: bestMech?.id ?? null,
             desiredLoadout,
             preferSilent: false,
             holdFireForRegen: false,
@@ -266,20 +324,20 @@ export function createStrategy(config: Config): Strategy {
         }
       }
 
-      // 2. Emergency Regen (with hysteresis): enter < 0.65 (Practice) or < 0.50 (FFA), stay until >= 0.92
-      const hpRatio = obs.self.hp / Math.max(1, obs.self.max_hp)
-      const regenThreshold = isPractice ? 0.65 : 0.50
-      if (!obs.self.in_zone || hpRatio >= 0.92) {
+      // Priority 2 — Kill-Confirm Override & Fast Combat Regen (regen_hide)
+      const killConfirmTarget = findKillConfirmTarget(obs, threats, world, eyeHeight)
+      const hasNanites = obs.self.upgrades.includes("nanites")
+      const enterRegenRatio = threats.spottedByCount >= 2 ? 0.55 : 0.42
+      const exitRegenRatio = hasNanites ? 0.88 : 0.80
+
+      if (killConfirmTarget !== null || !obs.self.in_zone || hpRatio >= exitRegenRatio) {
         inRegenHide = false
-      } else if (hpRatio < regenThreshold) {
+      } else if (hpRatio < enterRegenRatio && obs.self.in_zone) {
         inRegenHide = true
       }
 
       if (inRegenHide && obs.self.in_zone) {
-        const retreatTarget = findRetreatTarget(obs, threats, world)
-        const silentRegen = isPractice
-          ? practicePreferSilent
-          : threats.spottedByCount === 0 && hasEnemyWithin(threats.enemies, obs.self.pos, 45)
+        const retreatTarget = findRetreatTarget(obs, threats, world, eyeHeight)
         return {
           pick,
           order: {
@@ -287,129 +345,41 @@ export function createStrategy(config: Config): Strategy {
             moveTarget: retreatTarget,
             primaryTargetId: null,
             desiredLoadout,
-            preferSilent: silentRegen,
+            preferSilent: false,
             holdFireForRegen: true,
           },
         }
       }
 
-      // 3. 1v15 Practice Mode
-      if (isPractice) {
-        const preferSilent = practicePreferSilent
-
-        // Only collect loose cubes and ground pickups when unspotted (never shoot crates or NPCs in Practice)
-        if (threats.spottedByCount === 0) {
-          if (obs.self.cubes < 8) {
-            for (const c of obs.cubes) {
-              if (
-                dist2D(obs.self.pos, c.pos) <= 40 &&
-                isPointInSafeZone(c.pos, obs, 6) &&
-                !hasEnemyWithin(threats.enemies, c.pos, 50)
-              ) {
-                return {
-                  pick,
-                  order: {
-                    mode: "farm_crate",
-                    moveTarget: c.pos,
-                    primaryTargetId: null,
-                    desiredLoadout,
-                    preferSilent,
-                    holdFireForRegen: false,
-                  },
-                }
-              }
-            }
-          }
-
-          // Safe desired weapon pickup
-          const pickupPos = findDesiredPickup(obs, desiredLoadout, 45, threats.enemies, 50)
-          if (pickupPos) {
-            return {
-              pick,
-              order: {
-                mode: "farm_crate",
-                moveTarget: pickupPos,
-                primaryTargetId: null,
-                desiredLoadout,
-                preferSilent,
-                holdFireForRegen: false,
-              },
-            }
-          }
-        }
-
-        // Ghost kite: stay behind cover, lob mortar over walls, splash contested drops
-        const target = pickBestMechTarget(obs, threats, true)
-        const mechPositions = threats.enemies
-          .filter((e) => e.kind === "mech")
-          .map((e) => e.pos)
-
-        let moveTarget: Vec3 | null = null
-        if (mechPositions.length > 0) {
-          const cover = world.findCover(
-            obs.self.pos,
-            mechPositions,
-            36,
-            (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
-            obs.self.stats.eye_height ?? 8,
-          )
-          if (cover) {
-            moveTarget = cover
-          } else if (target) {
-            const kiteRange = held.has("mortar") ? 65 : 42
-            moveTarget = getStandoffPoint(obs.self.pos, target.pos, kiteRange, obs, world)
-          }
-        } else if (held.has("mortar") && obs.drops.length > 0) {
-          // Position within mortar range of an active drop without walking into it
-          const activeDrop = obs.drops.find(
-            (d) => (d.lands_in <= 10 || d.holder !== null) && isPointInSafeZone(d.pos, obs, 6),
-          )
-          if (activeDrop) {
-            const d = dist2D(obs.self.pos, activeDrop.pos)
-            if (d > 140) {
-              moveTarget = getStandoffPoint(obs.self.pos, activeDrop.pos, 95, obs, world)
-            }
-          }
-        }
-
-        if (!moveTarget && !zoneAdvice.inNextSafe) {
-          moveTarget = zoneAdvice.moveTarget
-        }
-
-        return {
-          pick,
-          order: {
-            mode: "ghost_kite",
-            moveTarget,
-            primaryTargetId: target?.id ?? null,
-            desiredLoadout,
-            preferSilent,
-            holdFireForRegen: false,
-          },
-        }
-      }
-
-      // 4. 16-mech FFA Mode
-      // 4a. Contest supply drops when healthy and few enemies nearby
-      if (hpRatio > 0.7 && threats.spottedByCount <= 1) {
+      // Priority 3 — Uncontested Supply Drops (contest_drop)
+      if (obs.drops.length > 0 && !(killConfirmTarget && hpRatio < enterRegenRatio)) {
         let bestDropPos: Vec3 | null = null
         let bestDropDist = Infinity
         let dropEnemyId: number | null = null
 
         for (const drop of obs.drops) {
-          if (drop.lands_in > 12) continue
+          if (drop.lands_in > 14) continue
           if (!isPointInSafeZone(drop.pos, obs, 4)) continue
-          const nearbyMechs = countMechsNear(threats.enemies, drop.pos, 55)
-          if (nearbyMechs > 1) continue
+          if (countMechsNear(threats.enemies, drop.pos, 45) > 1) continue
 
-          const d = dist2D(obs.self.pos, drop.pos)
-          if (d < bestDropDist) {
-            bestDropDist = d
+          const myDist = dist2D(obs.self.pos, drop.pos)
+          let nearestEnemyToDrop = Infinity
+          let nearEnemyId: number | null = null
+          for (const e of threats.enemies) {
+            if (e.kind !== "mech") continue
+            const ed = dist2D(e.pos, drop.pos)
+            if (ed < nearestEnemyToDrop) {
+              nearestEnemyToDrop = ed
+              if (ed <= 45) nearEnemyId = e.id
+            }
+          }
+
+          if (!(hpRatio > 0.45 || myDist < nearestEnemyToDrop)) continue
+
+          if (myDist < bestDropDist) {
+            bestDropDist = myDist
             bestDropPos = drop.pos
-            const nearEnemy = threats.enemies.find(
-              (e) => e.kind === "mech" && dist2D(e.pos, drop.pos) <= 55,
-            )
-            dropEnemyId = nearEnemy?.id ?? null
+            dropEnemyId = nearEnemyId
           }
         }
 
@@ -428,41 +398,46 @@ export function createStrategy(config: Config): Strategy {
         }
       }
 
-      // 4b. Grab nearby desired weapon pickups
-      const ffaPickup = findDesiredPickup(obs, desiredLoadout, 45, threats.enemies, 25)
-      if (ffaPickup) {
-        return {
-          pick,
-          order: {
-            mode: "farm_crate",
-            moveTarget: ffaPickup,
-            primaryTargetId: null,
-            desiredLoadout,
-            preferSilent: false,
-            holdFireForRegen: false,
-          },
-        }
-      }
+      const bestMech = killConfirmTarget ?? pickBestMechTarget(obs, threats, world, eyeHeight)
 
-      // 4c. Early/mid game farming up to ~10 cubes (avoid bloating past ~12)
-      if (obs.self.cubes < 10) {
-        // Free loose cubes first
-        let bestCubePos: Vec3 | null = null
-        let bestCubeDist = 35
-        for (const c of obs.cubes) {
-          const d = dist2D(obs.self.pos, c.pos)
-          if (d < bestCubeDist && isPointInSafeZone(c.pos, obs, 6)) {
+      // Priority 4 — Blitz-Snowball Economy (0-10 Cubes + 2nd Weapon)
+      if (!killConfirmTarget) {
+        // 4a. Scoop loose cubes within 45m if < 14 cubes and safe from 2+ enemies on top of it
+        if (obs.self.cubes < 14) {
+          let bestCubePos: Vec3 | null = null
+          let bestCubeDist = 45
+          for (const c of obs.cubes) {
+            if (!isPointInSafeZone(c.pos, obs, 6)) continue
+            const d = dist2D(obs.self.pos, c.pos)
+            if (d > bestCubeDist) continue
+            if (countMechsNear(threats.enemies, c.pos, 25) >= 2) continue
             bestCubeDist = d
             bestCubePos = c.pos
           }
+          if (bestCubePos) {
+            return {
+              pick,
+              order: {
+                mode: "farm_crate",
+                moveTarget: bestCubePos,
+                primaryTargetId: bestMech?.id ?? null,
+                desiredLoadout,
+                preferSilent: false,
+                holdFireForRegen: false,
+              },
+            }
+          }
         }
-        if (bestCubePos) {
+
+        // 4b. Grab desired floor pickups within 70m if empty slot or strict upgrade (laser/lightning)
+        const pickupPos = findDesiredPickup(obs, desiredLoadout, 70, threats.enemies)
+        if (pickupPos) {
           return {
             pick,
             order: {
               mode: "farm_crate",
-              moveTarget: bestCubePos,
-              primaryTargetId: null,
+              moveTarget: pickupPos,
+              primaryTargetId: bestMech?.id ?? null,
               desiredLoadout,
               preferSilent: false,
               holdFireForRegen: false,
@@ -470,35 +445,49 @@ export function createStrategy(config: Config): Strategy {
           }
         }
 
-        // Compare nearby crates and NPC drones
-        let bestFarmMode: "farm_crate" | "farm_npc" | null = null
-        let bestFarmPos: Vec3 | null = null
-        let bestFarmTargetId: number | null = null
-        let bestFarmScore = -Infinity
-
-        for (const crate of obs.crates) {
-          if (!isPointInSafeZone(crate.pos, obs, 6)) continue
-          const d = dist2D(obs.self.pos, crate.pos)
-          if (d > 85) continue
-          if (hasEnemyWithin(threats.enemies, crate.pos, 35)) continue
-          const score = 40 - d
-          if (score > bestFarmScore) {
-            bestFarmScore = score
-            bestFarmMode = "farm_crate"
-            bestFarmPos = crate.pos
-            bestFarmTargetId = null
+        // 4c. Aggressively farm nearby crates & NPC drones within 95m while < 10 cubes
+        let nearestVisibleMechDist = Infinity
+        for (const e of threats.enemies) {
+          if (e.kind === "mech" && e.confidence >= 0.85) {
+            const d = dist2D(obs.self.pos, e.pos)
+            if (d < nearestVisibleMechDist) nearestVisibleMechDist = d
           }
         }
 
-        if (hpRatio > 0.55) {
+        const safeToFarm =
+          threats.spottedByCount === 0 || (nearestVisibleMechDist > 65 && hpRatio > 0.6)
+
+        if (obs.self.cubes < 10 && safeToFarm) {
+          const hasEmptySlot = obs.self.weapons.some((w) => w === null)
+          let bestFarmMode: "farm_crate" | "farm_npc" | null = null
+          let bestFarmPos: Vec3 | null = null
+          let bestFarmTargetId: number | null = null
+          let bestFarmScore = -Infinity
+
+          for (const crate of obs.crates) {
+            if (!isPointInSafeZone(crate.pos, obs, 6)) continue
+            const d = dist2D(obs.self.pos, crate.pos)
+            if (d > 95) continue
+            if (countMechsNear(threats.enemies, crate.pos, 30) > 0) continue
+
+            const score = (hasEmptySlot ? 60 : 45) - d
+            if (score > bestFarmScore) {
+              bestFarmScore = score
+              bestFarmMode = "farm_crate"
+              bestFarmPos = crate.pos
+              bestFarmTargetId = null
+            }
+          }
+
           for (const e of threats.enemies) {
             if (e.kind !== "npc") continue
             if (!isPointInSafeZone(e.pos, obs, 6)) continue
             const d = dist2D(obs.self.pos, e.pos)
-            if (d > 85) continue
-            if (hasEnemyWithin(threats.enemies, e.pos, 35)) continue
+            if (d > 95) continue
+            if (countMechsNear(threats.enemies, e.pos, 30) > 0) continue
+
             // NPCs drop 2 cubes vs 1 for crate
-            const score = 55 - d
+            const score = 68 - d
             if (score > bestFarmScore) {
               bestFarmScore = score
               bestFarmMode = "farm_npc"
@@ -506,34 +495,74 @@ export function createStrategy(config: Config): Strategy {
               bestFarmTargetId = e.id
             }
           }
-        }
 
-        if (bestFarmMode && bestFarmPos) {
-          return {
-            pick,
-            order: {
-              mode: bestFarmMode,
-              moveTarget: bestFarmPos,
-              primaryTargetId: bestFarmTargetId,
-              desiredLoadout,
-              preferSilent: false,
-              holdFireForRegen: false,
-            },
+          if (bestFarmMode && bestFarmPos) {
+            return {
+              pick,
+              order: {
+                mode: bestFarmMode,
+                moveTarget: bestFarmPos,
+                primaryTargetId: bestFarmTargetId,
+                desiredLoadout,
+                preferSilent: false,
+                holdFireForRegen: false,
+              },
+            }
           }
         }
       }
 
-      // 4d. Third-party / engage wounded mechs or combat sounds
-      const target = pickBestMechTarget(obs, threats, false)
-      if (target) {
-        const range = getPreferredCombatRange(held)
-        const moveTarget = getStandoffPoint(obs.self.pos, target.pos, range, obs, world)
+      // Priority 5 — Active 1v1 Execution & 1vN "Slice-the-Pie" (engage)
+      if (bestMech) {
+        const otherMechs = threats.enemies
+          .filter(
+            (e) =>
+              e.kind === "mech" &&
+              e.id !== bestMech.id &&
+              dist2D(obs.self.pos, e.pos) < 160,
+          )
+          .map((e) => e.pos)
+
+        let moveTarget: Vec3
+        if (threats.spottedByCount >= 2 && otherMechs.length > 0) {
+          // 1vN Slice-the-Pie: isolate bestMech behind cover from otherMechs
+          const peekCover = world.findPeekCover(
+            obs.self.pos,
+            bestMech.pos,
+            otherMechs,
+            32,
+            (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
+            eyeHeight,
+          )
+          if (peekCover) {
+            moveTarget = peekCover
+          } else {
+            const cover = world.findCover(
+              obs.self.pos,
+              otherMechs,
+              32,
+              (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
+              eyeHeight,
+            )
+            if (cover) {
+              moveTarget = cover
+            } else {
+              const optRange = held.has("lightning") ? 28 : held.has("laser") ? 58 : 44
+              moveTarget = getOrbitalStrafePoint(obs, bestMech.pos, optRange, world)
+            }
+          }
+        } else {
+          // 1v1 Duel: Orbital Strafe at optimal weapon range
+          const optRange = held.has("lightning") ? 28 : held.has("laser") ? 58 : 44
+          moveTarget = getOrbitalStrafePoint(obs, bestMech.pos, optRange, world)
+        }
+
         return {
           pick,
           order: {
             mode: "engage",
             moveTarget,
-            primaryTargetId: target.id,
+            primaryTargetId: bestMech.id,
             desiredLoadout,
             preferSilent: false,
             holdFireForRegen: false,
@@ -541,6 +570,7 @@ export function createStrategy(config: Config): Strategy {
         }
       }
 
+      // Priority 6 — Active Hunter Search
       const soundTarget = findSoundInvestigatePoint(obs, world)
       if (soundTarget) {
         return {
@@ -556,16 +586,34 @@ export function createStrategy(config: Config): Strategy {
         }
       }
 
-      // Fallback: rotate toward safe next_center
-      const fallbackTarget = zoneAdvice.distToNextCenter > Math.max(25, zoneAdvice.safeRadius * 0.5)
-        ? zoneAdvice.moveTarget
-        : null
+      // Patrol the inner safe-zone ring (0.45 * next_radius) to hunt down next enemy/crate
+      const [ncx, ncy] = obs.zone.next_center
+      const patrolRadius = Math.max(
+        6,
+        Math.min(zoneAdvice.safeRadius, obs.zone.next_radius * 0.45),
+      )
+
+      if (patrolAngle === null) {
+        patrolAngle = Math.atan2(obs.self.pos[1] - ncy, obs.self.pos[0] - ncx) + 0.75
+      }
+
+      let px = ncx + Math.cos(patrolAngle) * patrolRadius
+      let py = ncy + Math.sin(patrolAngle) * patrolRadius
+      const reachThreshold = Math.min(18, Math.max(5, patrolRadius * 0.5))
+
+      if (dist2D(obs.self.pos, [px, py]) < reachThreshold) {
+        patrolAngle += 0.9
+        px = ncx + Math.cos(patrolAngle) * patrolRadius
+        py = ncy + Math.sin(patrolAngle) * patrolRadius
+      }
+
+      const patrolTarget = clampToSafeZone(px, py, obs, world)
 
       return {
         pick,
         order: {
           mode: "engage",
-          moveTarget: fallbackTarget,
+          moveTarget: patrolTarget,
           primaryTargetId: null,
           desiredLoadout,
           preferSilent: false,

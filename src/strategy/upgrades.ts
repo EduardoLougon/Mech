@@ -1,18 +1,38 @@
 import type { Config, Observation, UpgradeDef, WeaponKind } from "../mechfight.ts"
 
 const BASE_UPGRADE_SCORES: Record<string, number> = {
-  armor: 110,
-  sensors: 98,
-  hp: 94,
-  speed: 90,
-  energy: 76,
+  nanites: 140,
+  armor: 125,
+  plating: 118,
+  servos: 105,
+  gyros: 96,
+  reactor: 92,
+  jets: 90,
+  sensors: 88,
+  capacitor: 82,
 }
 
-const WEAPON_TIER_BONUS: Record<WeaponKind, number> = {
-  laser: 10,
+const WEAPON_UPGRADE_SCORES: Record<string, { weapon: WeaponKind; score: number }> = {
+  laser_charge: { weapon: "laser", score: 116 },
+  laser_damage: { weapon: "laser", score: 113 },
+  laser_pierce: { weapon: "laser", score: 96 },
+  lightning_efficiency: { weapon: "lightning", score: 114 },
+  lightning_range: { weapon: "lightning", score: 111 },
+  lightning_chain: { weapon: "lightning", score: 109 },
+  gun_rate: { weapon: "gun", score: 106 },
+  gun_damage: { weapon: "gun", score: 103 },
+  gun_mag: { weapon: "gun", score: 99 },
+  gun_velocity: { weapon: "gun", score: 93 },
+  mortar_reload: { weapon: "mortar", score: 97 },
+  mortar_splash: { weapon: "mortar", score: 95 },
+  mortar_velocity: { weapon: "mortar", score: 91 },
+}
+
+const WEAPON_FALLBACK_BONUS: Record<WeaponKind, number> = {
+  laser: 18,
+  lightning: 16,
+  gun: 10,
   mortar: 8,
-  lightning: 8,
-  gun: 4,
 }
 
 /**
@@ -29,54 +49,57 @@ function scoreChoice(
   const def = upgradeDefs.get(choiceId)
   const taken = takenCounts.get(choiceId) ?? 0
 
-  // Start with explicit base tier score if known
-  let score = BASE_UPGRADE_SCORES[choiceId] ?? 50
+  let score = 50
+  const weaponEntry = WEAPON_UPGRADE_SCORES[choiceId]
 
-  if (def) {
-    // Penalize slightly if near max stacks so we diversify when tied, though strong stats remain strong
-    if (def.max > 0 && taken >= def.max) {
-      score -= 1000
-    }
-
-    if (def.requires) {
-      if (heldWeapons.has(def.requires)) {
-        // Weapon-specific upgrade for a weapon we actually hold
-        score = 78 + WEAPON_TIER_BONUS[def.requires]
-      } else {
-        // We don't hold the required weapon right now
-        score = 20
-      }
-    } else if (!(choiceId in BASE_UPGRADE_SCORES)) {
-      // Score unknown general upgrades by their effect paths
-      for (const eff of def.effects) {
-        if (eff.path.includes("armor") || eff.path.includes("damage_taken")) score += 40
-        else if (eff.path.includes("vision") || eff.path.includes("sensor")) score += 32
-        else if (eff.path.includes("hp")) score += 28
-        else if (eff.path.includes("speed")) score += 24
-        else if (eff.path.includes("energy")) score += 18
-      }
+  if (weaponEntry) {
+    const reqWeapon = def?.requires ?? weaponEntry.weapon
+    score = heldWeapons.has(reqWeapon) ? weaponEntry.score : 20
+  } else if (def?.requires) {
+    score = heldWeapons.has(def.requires) ? 84 + WEAPON_FALLBACK_BONUS[def.requires] : 20
+  } else if (choiceId in BASE_UPGRADE_SCORES) {
+    score = BASE_UPGRADE_SCORES[choiceId]
+  } else if (def) {
+    // Score unknown general upgrades by their effect paths
+    for (const eff of def.effects) {
+      if (eff.path.includes("regen")) score += 55
+      else if (eff.path.includes("armor") || eff.path.includes("damage_taken")) score += 45
+      else if (eff.path.includes("hp")) score += 38
+      else if (eff.path.includes("speed")) score += 30
+      else if (eff.path.includes("turn")) score += 24
+      else if (eff.path.includes("vision") || eff.path.includes("sensor")) score += 22
+      else if (eff.path.includes("energy") || eff.path.includes("jet")) score += 20
     }
   } else {
     // Fallback heuristic on id/name/desc if not in config.upgrades
     const text = `${choiceId} ${choiceName} ${choiceDesc}`.toLowerCase()
-    if (text.includes("armor") || text.includes("damage taken")) score = 110
-    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 98
-    else if (text.includes("hp") || text.includes("health")) score = 94
-    else if (text.includes("speed") || text.includes("move")) score = 90
-    else if (text.includes("energy")) score = 76
+    if (text.includes("nanite") || text.includes("regen")) score = 140
+    else if (text.includes("armor") || text.includes("damage taken")) score = 125
+    else if (text.includes("plating") || text.includes("hp") || text.includes("health")) score = 118
+    else if (text.includes("servo") || text.includes("speed") || text.includes("move")) score = 105
+    else if (text.includes("gyro") || text.includes("turn")) score = 96
+    else if (text.includes("reactor")) score = 92
+    else if (text.includes("jet")) score = 90
+    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 88
+    else if (text.includes("capacitor") || text.includes("energy")) score = 82
     else {
       for (const w of heldWeapons) {
         if (text.includes(w)) {
-          score = 78 + WEAPON_TIER_BONUS[w]
+          score = 84 + WEAPON_FALLBACK_BONUS[w]
           break
         }
       }
     }
   }
 
-  // Slight preference for first stack of top-tier utility upgrades (e.g., sensors)
-  if (choiceId === "sensors" && taken === 0) {
-    score += 4
+  // S+ tier first-stack bonus for nanites (2 stacks -> 2.0s regen delay at 115 HP/s)
+  if (choiceId === "nanites" && taken === 0) {
+    score += 5
+  }
+
+  // Never pick an already-maxed upgrade over an available one
+  if (def && def.max > 0 && taken >= def.max) {
+    score -= 1000
   }
 
   return score

@@ -554,3 +554,129 @@ export function findCover(
 
   return bestCandidate
 }
+
+export function findPeekCover(
+  nav: NavGrid,
+  world: WorldData,
+  scratch: RaycastScratch,
+  pos: Vec3,
+  targetPos: Vec3,
+  otherThreats: Vec3[],
+  radius: number,
+  isSafe?: (x: number, y: number) => boolean,
+  eyeHeight = 8,
+): Vec3 | null {
+  const threatCount = otherThreats.length
+  if (threatCount === 0 || radius <= 0) return null
+
+  const [cx, cy] = worldToGrid(nav, pos[0], pos[1])
+  const startIdx = cy * nav.nx + cx
+  const onRoof = pos[2] > nav.cellZ[startIdx] + 1.5
+
+  const rCells = Math.max(1, Math.ceil(radius / nav.step))
+  const rSq = radius * radius
+  const innerRSq = 16 * 16
+
+  const candidates: Array<{ wx: number; wy: number; wz: number; distSq: number }> = []
+  const gx0 = Math.max(0, cx - rCells)
+  const gx1 = Math.min(nav.nx - 1, cx + rCells)
+  const gy0 = Math.max(0, cy - rCells)
+  const gy1 = Math.min(nav.ny - 1, cy + rCells)
+
+  for (let gy = gy0; gy <= gy1; gy++) {
+    const wy = nav.minY + (gy + 0.5) * nav.step
+    const dy = wy - pos[1]
+    const dySq = dy * dy
+    const row = gy * nav.nx
+    const oddY = ((gy - cy) & 1) !== 0
+    for (let gx = gx0; gx <= gx1; gx++) {
+      const idx = row + gx
+      let wz: number
+      if (nav.cellBlocked[idx] === 1) {
+        if (!onRoof) continue
+        const roofZ = nav.cellRoofZ[idx]
+        if (roofZ <= nav.cellZ[idx] + 1.5 || roofZ > pos[2] + 1.5 || pos[2] - roofZ > 4.5) {
+          continue
+        }
+        wz = roofZ
+      } else if (
+        onRoof &&
+        nav.cellRoofZ[idx] > nav.cellZ[idx] + 1.5 &&
+        nav.cellRoofZ[idx] <= pos[2] + 1.5 &&
+        pos[2] - nav.cellRoofZ[idx] <= 4.5
+      ) {
+        wz = nav.cellRoofZ[idx]
+      } else {
+        if (nav.cellSlope[idx] > nav.maxSlopeDeg) continue
+        wz = nav.cellZ[idx]
+      }
+
+      const wx = nav.minX + (gx + 0.5) * nav.step
+      const dx = wx - pos[0]
+      const distSq = dx * dx + dySq
+      if (distSq > rSq) continue
+      if (distSq > innerRSq && (oddY || ((gx - cx) & 1) !== 0)) continue
+      if (isSafe && !isSafe(wx, wy)) continue
+      candidates.push({ wx, wy, wz, distSq })
+    }
+  }
+
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => a.distSq - b.distSq)
+
+  const maxToTest = Math.min(candidates.length, 160)
+  const muzzleOffset = Math.max(6, eyeHeight - 1)
+  const targetCenter: Vec3 = [targetPos[0], targetPos[1], targetPos[2] + 4.5]
+  const candMuzzle: Vec3 = [0, 0, 0]
+  const candEye: Vec3 = [0, 0, 0]
+  const threatEye: Vec3 = [0, 0, 0]
+
+  let bestCandidate: Vec3 | null = null
+  let bestExposed = threatCount
+  let bestScore = Infinity
+
+  for (let i = 0; i < maxToTest; i++) {
+    const c = candidates[i]
+    candMuzzle[0] = c.wx
+    candMuzzle[1] = c.wy
+    candMuzzle[2] = c.wz + muzzleOffset
+
+    if (!hasShotLOS(world, scratch, candMuzzle, targetCenter)) {
+      continue
+    }
+
+    candEye[0] = c.wx
+    candEye[1] = c.wy
+    candEye[2] = c.wz + eyeHeight
+
+    let exposed = 0
+    let minThreatDistSq = Infinity
+
+    for (let t = 0; t < threatCount; t++) {
+      const th = otherThreats[t]
+      const tdx = c.wx - th[0]
+      const tdy = c.wy - th[1]
+      const tDistSq = tdx * tdx + tdy * tdy
+      if (tDistSq < minThreatDistSq) minThreatDistSq = tDistSq
+
+      threatEye[0] = th[0]
+      threatEye[1] = th[1]
+      threatEye[2] = th[2] + eyeHeight
+      if (hasShotLOS(world, scratch, threatEye, candEye)) {
+        exposed++
+        if (exposed > bestExposed || exposed >= threatCount) break
+      }
+    }
+
+    if (exposed > bestExposed || exposed >= threatCount) continue
+
+    const score = Math.sqrt(c.distSq) - 0.5 * Math.sqrt(minThreatDistSq)
+    if (exposed < bestExposed || score < bestScore) {
+      bestExposed = exposed
+      bestScore = score
+      bestCandidate = [c.wx, c.wy, c.wz]
+    }
+  }
+
+  return bestCandidate
+}
