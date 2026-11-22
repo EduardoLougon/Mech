@@ -4,7 +4,7 @@ import type {
   ThreatState,
   WorldQuery,
 } from "../contracts.ts"
-import { createDodge } from "./dodge.ts"
+import { computeDodge } from "./dodge.ts"
 import { createTracker } from "./tracker.ts"
 
 export interface PerceptionModule {
@@ -18,18 +18,17 @@ export interface PerceptionModule {
  */
 export function createPerception(config: Config): PerceptionModule {
   const tracker = createTracker(config)
-  const dodge = createDodge(config)
 
   function update(obs: Observation, world: WorldQuery): ThreatState {
     const tracked = tracker.update(obs, world)
-    const dodgeRes = dodge.update(obs, world)
+    const dodge = computeDodge(obs, config, world)
 
     return {
       enemies: tracked.enemies,
-      dodgeVec: dodgeRes.dodgeVec,
-      dodgeUrgency: dodgeRes.dodgeUrgency,
-      wantJump: dodgeRes.wantJump,
-      chargingLaserThreat: dodgeRes.chargingLaserThreat,
+      dodgeVec: dodge.dodgeVec,
+      dodgeUrgency: dodge.dodgeUrgency,
+      wantJump: false,
+      chargingLaserThreat: false,
       primaryThreatBearing: tracked.primaryThreatBearing,
       spottedByCount: tracked.spottedByCount,
       ffaConfidence: tracked.ffaConfidence,
@@ -39,5 +38,6 @@ export function createPerception(config: Config): PerceptionModule {
   return { update }
 }
 
-export { createDodge } from "./dodge.ts"
+export { computeDodge } from "./dodge.ts"
 export { createTracker } from "./tracker.ts"
+

@@ -248,6 +248,7 @@ function computeOptimalCombatRange(
   config: Config,
   target: TrackedEnemy,
   otherMechsCount: number,
+  _realMechs: TrackedEnemy[],
 ): number {
   const laserW = obs.self.weapons.find((w) => w?.kind === "laser") ?? null
   const lightningW = obs.self.weapons.find((w) => w?.kind === "lightning") ?? null
@@ -256,30 +257,25 @@ function computeOptimalCombatRange(
   const lightningRange =
     lightningW?.stats?.range ?? config.weapons.lightning?.range ?? 45
 
+  // When holding Lightning, fight inside Lightning range (~76% of range) so BOTH Lightning (240-525 DPS + short!)
+  // and Laser/Gun fire continuously! Only pull back slightly in 1v3+ packs.
   if (lightningW) {
-    const isolated1v1 = otherMechsCount === 0
-    const laserOnCooldown = laserW !== null && laserW.cooldown > 0.6
-    const shouldCloseForLightning =
-      isolated1v1 && (!laserW || laserOnCooldown || target.charging)
-
-    if (shouldCloseForLightning) {
-      return lightningRange * 0.78
+    if (otherMechsCount >= 2 && laserW) {
+      return Math.min(44, lightningRange * 0.92)
     }
+    return Math.max(24, lightningRange * 0.76)
   }
 
+  if (laserW && gunW) {
+    return target.weapons.includes("lightning") ? 64 : 52
+  }
   if (laserW) {
-    return 68
+    return 62
   }
-
-  if (lightningW) {
-    return Math.max(40, lightningRange * 0.88)
-  }
-
   if (gunW) {
-    return 44
+    return target.weapons.includes("lightning") ? 58 : 44
   }
-
-  return 62
+  return 58
 }
 
 interface StrafeResult {
@@ -582,15 +578,13 @@ export function createStrategy(config: Config): Strategy {
       }
 
       let enterRegenRatio: number
-      if (threats.spottedByCount >= 3) {
-        enterRegenRatio = naniteStacks >= 2 ? 0.58 : 0.54
-      } else if (threats.spottedByCount === 2) {
-        enterRegenRatio = naniteStacks >= 2 ? 0.54 : 0.48
+      if (threats.spottedByCount >= 2) {
+        enterRegenRatio = naniteStacks >= 2 ? 0.52 : 0.48
       } else {
-        enterRegenRatio = naniteStacks >= 2 ? 0.48 : 0.42
+        enterRegenRatio = naniteStacks >= 2 ? 0.45 : 0.40
       }
 
-      const exitRegenRatio = naniteStacks >= 1 ? 0.86 : 0.80
+      const exitRegenRatio = naniteStacks >= 1 ? 0.86 : 0.82
 
       if (killConfirmTarget !== null || !obs.self.in_zone || hpRatio >= exitRegenRatio) {
         inRegenHide = false
@@ -610,8 +604,11 @@ export function createStrategy(config: Config): Strategy {
         if (retreat.usedCover) {
           latchCover(retreat.target, obs.t)
         }
-        // Only hold fire if we actually found cover or are unspotted; if chased in open with no cover, shoot back!
-        const canActuallyBreakLOS = retreat.usedCover || threats.spottedByCount === 0
+        // Hold fire to complete 2-5s Nanite regen when cover is available or unspotted;
+        // only shoot back if an enemy is right on top of us (< 26m)
+        const chasedClose = threats.spottedByCount > 0 && nearestRealMechDist < 26
+        const canActuallyBreakLOS =
+          (retreat.usedCover || threats.spottedByCount === 0) && !chasedClose
         return {
           pick,
           order: {
@@ -636,20 +633,19 @@ export function createStrategy(config: Config): Strategy {
           if (!isPointInSafeZone(drop.pos, obs, 4)) continue
 
           const myDist = dist2D(obs.self.pos, drop.pos)
-          const maxDropDist = hpRatio < 0.75 ? 180 : 135
+          const maxDropDist = hpRatio < 0.70 ? 220 : 180
           if (myDist > maxDropDist) continue
           // Don't march past a close enemy who is actively fighting us
-          if (nearestRealMechDist <= 55 && myDist > drop.radius + 12) continue
+          if (nearestRealMechDist <= 45 && myDist > drop.radius + 14) continue
           const almostCaptured =
             (drop.holder === obs.self.id || myDist <= drop.radius + 4) &&
-            drop.progress >= 2.5 &&
-            hpRatio > 0.5
+            drop.progress >= 2.2 &&
+            hpRatio > 0.4
 
           if (isPractice) {
             if (
               !almostCaptured &&
-              (countMechsNear(realMechs, drop.pos, 65) > 0 ||
-                nearestRealMechDist <= 65 ||
+              (countMechsNear(realMechs, drop.pos, 40) > 0 ||
                 threats.spottedByCount >= 2)
             ) {
               continue
@@ -690,11 +686,11 @@ export function createStrategy(config: Config): Strategy {
             )
               ? bestDrop.pos
               : world.snapToWalkable(
-                  bestDrop.pos[0],
-                  bestDrop.pos[1],
-                  obs.self.pos[2],
-                  mechRadius,
-                )
+                bestDrop.pos[0],
+                bestDrop.pos[1],
+                obs.self.pos[2],
+                mechRadius,
+              )
           } else {
             // Stage at nearest cover 20-45m from the drop until ready to rush
             const dropPos = bestDrop.pos
@@ -811,8 +807,8 @@ export function createStrategy(config: Config): Strategy {
           }
         }
 
-        // 4c. Farm crates & NPCs up to 10 cubes ONLY when completely unspotted & nearest real mech > 80m
-        const safeToFarm = threats.spottedByCount === 0 && nearestRealMechDist > 80
+        // 4c. Farm crates & NPCs up to 10 cubes when unspotted & nearest real mech > 60m
+        const safeToFarm = threats.spottedByCount === 0 && nearestRealMechDist > 60
 
         if (obs.self.cubes < 10 && safeToFarm) {
           const hasEmptySlot = obs.self.weapons.some((w) => w === null)
@@ -846,12 +842,12 @@ export function createStrategy(config: Config): Strategy {
             if (d > 95) continue
             if (countMechsNear(realMechs, e.pos, 30) > 0) continue
 
-            // NPCs drop 2 cubes vs 1 for crate
-            const score = 68 - d
+            // NPCs drop 2 cubes vs 1 for crate; snipe from 56m (outside 45m NPC aggro range = 0 damage!)
+            const score = 72 - d
             if (score > bestFarmScore) {
               bestFarmScore = score
               bestFarmMode = "farm_npc"
-              bestFarmPos = getStandoffPoint(obs.self.pos, e.pos, 26, obs, world)
+              bestFarmPos = getStandoffPoint(obs.self.pos, e.pos, 56, obs, world)
               bestFarmTargetId = e.id
             }
           }
@@ -881,7 +877,13 @@ export function createStrategy(config: Config): Strategy {
           .filter((e) => e.id !== bestMech.id && dist2D(obs.self.pos, e.pos) <= 140)
           .map((e) => e.pos)
 
-        const optRange = computeOptimalCombatRange(obs, config, bestMech, otherMechs.length)
+        const optRange = computeOptimalCombatRange(
+          obs,
+          config,
+          bestMech,
+          otherMechs.length,
+          realMechs,
+        )
         const isSafe = (cx: number, cy: number) => isPointInSafeZone([cx, cy], obs, 4)
 
         let moveTarget: Vec3

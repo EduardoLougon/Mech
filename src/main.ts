@@ -39,11 +39,11 @@ run((hello) => {
   let eaveBackoffDir: Vec2 = [0, 0]
 
   log(
-    `mech-hydra-v4 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
+    `mech-hydra-v5 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
   )
 
   return {
-    name: "mech-hydra-v4",
+    name: "mech-hydra-v5",
     act(obs: Observation): BotAction {
       const t0 = performance.now()
       const me = obs.self
@@ -258,6 +258,16 @@ run((hello) => {
       }
 
       // Smart boost policy: ALWAYS gate sprint boost on `me.grounded` so we never accidentally sky-jet!
+      const hasLightning = me.weapons.some((w) => w?.kind === "lightning")
+      const closeLightningThreat =
+        !hasLightning &&
+        threats.enemies.some(
+          (e) =>
+            e.kind === "mech" &&
+            e.confidence >= 0.7 &&
+            e.weapons.includes("lightning") &&
+            Math.hypot(e.pos[0] - x, e.pos[1] - y) <= 58,
+        )
       if (!activeClimb && me.grounded) {
         if (!me.in_zone && me.energy > 12) {
           boost = true
@@ -265,20 +275,19 @@ run((hello) => {
           boost = true
         } else if (
           order.mode === "regen_hide" &&
-          threats.spottedByCount > 0 &&
           me.energy > 18
         ) {
           boost = true
         } else if (
-          threats.chargingLaserThreat &&
-          me.energy > 18
+          (threats.chargingLaserThreat || closeLightningThreat) &&
+          me.energy > 22
         ) {
           boost = true
         } else if (
           (order.mode === "contest_drop" || order.mode === "farm_crate") &&
           goal &&
-          Math.hypot(goal[0] - x, goal[1] - y) > 25 &&
-          me.energy > 65
+          Math.hypot(goal[0] - x, goal[1] - y) > 22 &&
+          me.energy > 55
         ) {
           boost = true
         }
@@ -296,7 +305,7 @@ run((hello) => {
         draw.point(goal, "#40c0ff", 5)
       }
       draw.label(
-        `v4 ${order.mode} c=${me.cubes} hp=${me.hp.toFixed(0)}`,
+        `v5 ${order.mode} c=${me.cubes} hp=${me.hp.toFixed(0)}`,
       )
 
       return act

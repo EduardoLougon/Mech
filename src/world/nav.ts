@@ -984,7 +984,8 @@ export function findCover(
 
       if (exposed >= threatCount || exposed > bestExposed) continue
 
-      let score = pathDist - 0.5 * Math.sqrt(minThreatDistSq)
+      const minThreatDist = Math.sqrt(minThreatDistSq)
+      let score = pathDist - 0.55 * minThreatDist
       if (prevCover != null) {
         const pdx = wx - prevCover[0]
         const pdy = wy - prevCover[1]
@@ -1117,7 +1118,8 @@ export function findPeekCover(
 
       if (exposed >= threatCount || exposed > bestExposed) continue
 
-      let score = pathDist - 0.5 * Math.sqrt(minThreatDistSq)
+      const minThreatDist = Math.sqrt(minThreatDistSq)
+      let score = pathDist - 0.55 * minThreatDist
       if (cellNearCover[idx] === 1) {
         score -= 4
       }

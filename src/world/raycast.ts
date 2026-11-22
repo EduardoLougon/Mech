@@ -109,7 +109,7 @@ export function isPointWalkable(
     return false
   }
 
-  const rOff = mechRadius > 0 ? mechRadius * 0.75 : 0
+  const rOff = mechRadius > 0 ? mechRadius * 0.5 : 0
   const maxBase = currentZ + mechHeight
   const minTop = currentZ + 1.2
   let onRoof = false

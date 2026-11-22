@@ -15,6 +15,7 @@ export interface TrackerOutput {
   ffaConfidence: number
 }
 
+const MECH_EYE_Z = 4.5
 const SOUND_MATCH_RAD = (15 * Math.PI) / 180
 const SOUND_GHOST_TTL_S = 2.5
 const DAMAGED_MEMORY_S = 2.0
@@ -75,10 +76,6 @@ function addWeapon(weapons: WeaponKind[], kind: WeaponKind): WeaponKind[] {
   return weapons.includes(kind) ? weapons : [...weapons, kind]
 }
 
-function enemyEyeZ(enemy: TrackedEnemy): number {
-  return enemy.kind === "npc" ? 2.5 : 8.0 * (1 + 0.05 * enemy.cubes)
-}
-
 interface SoundGhost {
   id: number
   bearing: number
@@ -90,7 +87,6 @@ interface RecentDamage {
   t: number
   by: number | null
   rear: boolean
-  fromMech: boolean
 }
 
 export function createTracker(config: Config) {
@@ -105,15 +101,13 @@ export function createTracker(config: Config) {
   const memoryS = config.vision.memory_s ?? 5
   const visionRange = config.vision.range ?? 200
   const nearRange = config.vision.near_range ?? 45
-  const defaultMechHp = config.mech.hp ?? 1400
-  const defaultNpcHp = config.npc.hp ?? 200
 
   function updateVisibleActors(obs: Observation): Set<number> {
     const visibleIds = new Set<number>()
     for (const m of obs.mechs) {
       visibleIds.add(m.id)
       const prev = tracked.get(m.id)
-      const defaultMaxHp = m.kind === "npc" ? defaultNpcHp : defaultMechHp
+      const defaultMaxHp = m.kind === "npc" ? 60 : 100
       const enemy: TrackedEnemy = {
         id: m.id,
         kind: m.kind,
@@ -170,9 +164,6 @@ export function createTracker(config: Config) {
       if (ev.type === "kill") {
         killsThisTick++
         tracked.delete(ev.target)
-        if (recentDamaged !== null && recentDamaged.by === ev.target) {
-          recentDamaged = null
-        }
       } else if (ev.type === "damaged") {
         if (ev.bearing !== null) {
           recentDamaged = {
@@ -180,8 +171,6 @@ export function createTracker(config: Config) {
             t: obs.t,
             by: ev.by,
             rear: Boolean(ev.rear),
-            fromMech:
-              ev.by !== null && ev.weapon !== "npc" && ev.weapon !== "zone",
           }
         }
         if (ev.by !== null && isWeaponKind(ev.weapon)) {
@@ -211,8 +200,7 @@ export function createTracker(config: Config) {
           pos: [origin[0], origin[1], origin[2]],
           vel: [0, 0, 0],
           aim: [aimYaw, 0],
-          hp: defaultMechHp,
-          maxHp: defaultMechHp,
+          hp: config.mech.hp ?? 1400, maxHp: config.mech.hp ?? 1400,
           cubes: 0,
           weapons: [beam.kind],
           charging: false,
@@ -289,8 +277,7 @@ export function createTracker(config: Config) {
             pos: ghostPos,
             vel: [0, 0, 0],
             aim: [normalizeAngle(s.bearing + Math.PI), 0],
-            hp: defaultMechHp,
-            maxHp: defaultMechHp,
+            hp: config.mech.hp ?? 1400, maxHp: config.mech.hp ?? 1400,
             cubes: 0,
             weapons: inferredWeapon,
             charging: s.kind === "laser_charge",
@@ -306,47 +293,26 @@ export function createTracker(config: Config) {
     obs: Observation,
     world: WorldQuery,
   ): number {
-    const selfEyeZ = obs.self.stats.eye_height ?? 8
     const selfEye: Vec3 = [
       obs.self.pos[0],
       obs.self.pos[1],
-      obs.self.pos[2] + selfEyeZ,
+      obs.self.pos[2] + MECH_EYE_Z,
     ]
-    const countedIds = new Set<number>()
     let count = 0
     for (const enemy of tracked.values()) {
       if (enemy.kind !== "mech" || enemy.confidence < 0.5) continue
       const d = dist3(enemy.pos, obs.self.pos)
-      if (d > visionRange) continue
-      const enemyEye: Vec3 = [
-        enemy.pos[0],
-        enemy.pos[1],
-        enemy.pos[2] + enemyEyeZ(enemy),
-      ]
       if (d <= nearRange) {
-        // Buildings/terrain block proximity sensors even within nearRange
-        if (world.hasShotLOS(enemyEye, selfEye)) {
-          count++
-          countedIds.add(enemy.id)
-        }
-      } else {
+        count++
+      } else if (d <= visionRange) {
+        const enemyEye: Vec3 = [
+          enemy.pos[0],
+          enemy.pos[1],
+          enemy.pos[2] + MECH_EYE_Z,
+        ]
         if (world.hasVisionLOS(enemyEye, selfEye)) {
           count++
-          countedIds.add(enemy.id)
         }
-      }
-    }
-
-    if (
-      recentDamaged !== null &&
-      recentDamaged.fromMech &&
-      recentDamaged.by !== null &&
-      obs.t - recentDamaged.t <= 1.2 &&
-      !countedIds.has(recentDamaged.by)
-    ) {
-      const attacker = tracked.get(recentDamaged.by)
-      if (!attacker || attacker.kind === "mech") {
-        count++
       }
     }
     return count
@@ -455,8 +421,7 @@ export function createTracker(config: Config) {
     world: WorldQuery,
   ): number | null {
     const selfPos = obs.self.pos
-    const selfEyeZ = obs.self.stats.eye_height ?? 8
-    const selfEye: Vec3 = [selfPos[0], selfPos[1], selfPos[2] + selfEyeZ]
+    const selfEye: Vec3 = [selfPos[0], selfPos[1], selfPos[2] + MECH_EYE_Z]
 
     // If hit recently from unseen/behind, immediately orient toward that bearing
     if (recentDamaged !== null && obs.t - recentDamaged.t <= 1.5) {
@@ -482,7 +447,7 @@ export function createTracker(config: Config) {
       }
 
       if (e.confidence >= 0.5) {
-        const enemyEye: Vec3 = [e.pos[0], e.pos[1], e.pos[2] + enemyEyeZ(e)]
+        const enemyEye: Vec3 = [e.pos[0], e.pos[1], e.pos[2] + MECH_EYE_Z]
         if (world.hasShotLOS(enemyEye, selfEye)) {
           score *= 1.4
         }
@@ -535,3 +500,4 @@ export function createTracker(config: Config) {
 
   return { update }
 }
+
