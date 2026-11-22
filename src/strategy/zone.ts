@@ -10,9 +10,14 @@ export interface ZoneAdvice {
 }
 
 const ZONE_SAFETY_MARGIN = 15
+const CURRENT_ZONE_MARGIN = 12
+const ZONE_BLEND_LEAD_S = 10
 
 /**
- * Compute a point inside `next_center` / `next_radius` closest to `fromPos`.
+ * Clamp a tactical/combat target inside the active safe zone.
+ * Before `shrink_start - 10s`, clamps to the CURRENT zone (`center`, `radius - 12`)
+ * to prevent early-game inward hijacking, then smoothly blends to `next_center / next_radius`.
+ * Always snaps the resulting point to the nearest walkable cell.
  */
 export function clampToSafeZone(
   x: number,
@@ -21,28 +26,46 @@ export function clampToSafeZone(
   world: WorldQuery,
   margin = ZONE_SAFETY_MARGIN,
 ): Vec3 {
+  const [ccx, ccy] = obs.zone.center
   const [ncx, ncy] = obs.zone.next_center
-  const safeR =
+
+  const curMargin = Math.min(margin, CURRENT_ZONE_MARGIN)
+  const curSafeR =
+    obs.zone.radius > curMargin
+      ? obs.zone.radius - curMargin
+      : obs.zone.radius * 0.5
+
+  const nextSafeR =
     obs.zone.next_radius > margin
       ? obs.zone.next_radius - margin
       : obs.zone.next_radius * 0.5
 
-  const dx = x - ncx
-  const dy = y - ncy
+  const blendStart = obs.zone.shrink_start - ZONE_BLEND_LEAD_S
+  let alpha = 0
+  if (obs.t >= blendStart) {
+    alpha = Math.max(0, Math.min(1, (obs.t - blendStart) / ZONE_BLEND_LEAD_S))
+  }
+
+  const cx = ccx + (ncx - ccx) * alpha
+  const cy = ccy + (ncy - ccy) * alpha
+  const safeR = curSafeR + (nextSafeR - curSafeR) * alpha
+
+  const dx = x - cx
+  const dy = y - cy
   const dist = Math.hypot(dx, dy)
 
   let tx = x
   let ty = y
-  if (dist > safeR && dist > 1e-3) {
+  if (safeR <= 1e-3) {
+    tx = cx
+    ty = cy
+  } else if (dist > safeR && dist > 1e-3) {
     const scale = safeR / dist
-    tx = ncx + dx * scale
-    ty = ncy + dy * scale
-  } else if (safeR <= 1e-3) {
-    tx = ncx
-    ty = ncy
+    tx = cx + dx * scale
+    ty = cy + dy * scale
   }
 
-  return [tx, ty, world.surfaceZAt(tx, ty, obs.self.pos[2])]
+  return world.snapToWalkable(tx, ty, obs.self.pos[2], obs.self.stats.radius)
 }
 
 /**
@@ -70,12 +93,14 @@ export function isPointInSafeZone(
 }
 
 /**
- * Evaluate zone urgency and compute a safe rotation target inside `next_center` / `next_radius`.
+ * Evaluate zone urgency and compute a walkable rotation target inside `next_center` / `next_radius`.
+ * Supports `wasSprinting` hysteresis to avoid oscillating across the safe-zone boundary.
  */
 export function evaluateZone(
   obs: Observation,
   world: WorldQuery,
   config: Config,
+  wasSprinting = false,
 ): ZoneAdvice {
   const pos = obs.self.pos
   const [ncx, ncy] = obs.zone.next_center
@@ -93,23 +118,35 @@ export function evaluateZone(
   const timeLeft = Math.max(0, obs.zone.shrink_end - obs.t)
   const timeToShrinkStart = obs.zone.shrink_start - obs.t
 
-  const moveSpeed = obs.self.stats.speed ?? config.mech.speed ?? 12
+  const moveSpeed = obs.self.stats.walk_speed ?? config.mech.walk_speed ?? 11.7
   const effectiveSpeed = Math.max(4, moveSpeed * 0.75)
-  const distToSafe = Math.max(0, distToNextCenter - safeRadius)
+
+  // Apply hysteresis margin when already sprinting so we step cleanly inside before releasing
+  const hysteresisRadius = wasSprinting ? Math.max(0, safeRadius - 6) : safeRadius
+  const distToSafe = Math.max(0, distToNextCenter - hysteresisRadius)
   const travelTime = distToSafe / effectiveSpeed
 
   const inNextSafe = distToNextCenter <= safeRadius
+  const inHysteresisSafe = distToNextCenter <= hysteresisRadius
 
   let mustSprint = false
   if (!obs.self.in_zone) {
     mustSprint = true
-  } else if (!inNextSafe) {
-    if (timeLeft <= travelTime + 4) {
-      mustSprint = true
-    } else if (timeToShrinkStart <= travelTime + 3 && obs.t >= obs.zone.shrink_start - 8) {
+  } else if (!inHysteresisSafe) {
+    const timeMargin = wasSprinting ? 6 : 4
+    const preShrinkMargin = wasSprinting ? 5 : 3
+    const preShrinkWindow = wasSprinting ? 10 : 8
+    const edgeMargin = wasSprinting ? 18 : 12
+
+    if (timeLeft <= travelTime + timeMargin) {
       mustSprint = true
     } else if (
-      currentEdgeMargin < 12 &&
+      timeToShrinkStart <= travelTime + preShrinkMargin &&
+      obs.t >= obs.zone.shrink_start - preShrinkWindow
+    ) {
+      mustSprint = true
+    } else if (
+      currentEdgeMargin < edgeMargin &&
       obs.zone.shrink_end > obs.t &&
       obs.t >= obs.zone.shrink_start - 3
     ) {
@@ -117,7 +154,7 @@ export function evaluateZone(
     }
   }
 
-  const targetRadius = Math.max(0, safeRadius - 5)
+  const targetRadius = Math.max(0, safeRadius - 6)
   let tx = ncx
   let ty = ncy
   if (distToNextCenter > 1e-3 && targetRadius > 0) {
@@ -125,7 +162,7 @@ export function evaluateZone(
     tx = ncx + (pos[0] - ncx) * scale
     ty = ncy + (pos[1] - ncy) * scale
   }
-  const moveTarget: Vec3 = [tx, ty, world.surfaceZAt(tx, ty, pos[2])]
+  const moveTarget = world.snapToWalkable(tx, ty, pos[2], obs.self.stats.radius)
 
   return {
     mustSprint,

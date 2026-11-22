@@ -1,29 +1,29 @@
 import type { Config, Observation, UpgradeDef, WeaponKind } from "../mechfight.ts"
 
 const BASE_UPGRADE_SCORES: Record<string, number> = {
-  nanites: 140,
-  armor: 125,
-  plating: 118,
-  servos: 105,
+  nanites: 145,
+  armor: 122,
+  plating: 121,
+  servos: 108,
+  sensors: 106,
   gyros: 96,
   reactor: 92,
   jets: 90,
-  sensors: 88,
   capacitor: 82,
 }
 
 const WEAPON_UPGRADE_SCORES: Record<string, { weapon: WeaponKind; score: number }> = {
-  laser_charge: { weapon: "laser", score: 116 },
-  laser_damage: { weapon: "laser", score: 113 },
-  laser_pierce: { weapon: "laser", score: 96 },
-  lightning_efficiency: { weapon: "lightning", score: 114 },
-  lightning_range: { weapon: "lightning", score: 111 },
-  lightning_chain: { weapon: "lightning", score: 109 },
-  gun_rate: { weapon: "gun", score: 106 },
-  gun_damage: { weapon: "gun", score: 103 },
+  laser_charge: { weapon: "laser", score: 124 },
+  laser_damage: { weapon: "laser", score: 119 },
+  laser_pierce: { weapon: "laser", score: 95 },
+  lightning_range: { weapon: "lightning", score: 120 },
+  lightning_chain: { weapon: "lightning", score: 108 },
+  lightning_efficiency: { weapon: "lightning", score: 106 },
+  gun_damage: { weapon: "gun", score: 112 },
+  gun_rate: { weapon: "gun", score: 102 },
   gun_mag: { weapon: "gun", score: 99 },
   gun_velocity: { weapon: "gun", score: 93 },
-  mortar_reload: { weapon: "mortar", score: 97 },
+  mortar_reload: { weapon: "mortar", score: 96 },
   mortar_splash: { weapon: "mortar", score: 95 },
   mortar_velocity: { weapon: "mortar", score: 91 },
 }
@@ -73,14 +73,14 @@ function scoreChoice(
   } else {
     // Fallback heuristic on id/name/desc if not in config.upgrades
     const text = `${choiceId} ${choiceName} ${choiceDesc}`.toLowerCase()
-    if (text.includes("nanite") || text.includes("regen")) score = 140
-    else if (text.includes("armor") || text.includes("damage taken")) score = 125
-    else if (text.includes("plating") || text.includes("hp") || text.includes("health")) score = 118
-    else if (text.includes("servo") || text.includes("speed") || text.includes("move")) score = 105
+    if (text.includes("nanite") || text.includes("regen")) score = 145
+    else if (text.includes("armor") || text.includes("damage taken")) score = 122
+    else if (text.includes("plating") || text.includes("hp") || text.includes("health")) score = 121
+    else if (text.includes("servo") || text.includes("speed") || text.includes("move")) score = 108
+    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 106
     else if (text.includes("gyro") || text.includes("turn")) score = 96
     else if (text.includes("reactor")) score = 92
     else if (text.includes("jet")) score = 90
-    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 88
     else if (text.includes("capacitor") || text.includes("energy")) score = 82
     else {
       for (const w of heldWeapons) {
@@ -95,6 +95,16 @@ function scoreChoice(
   // S+ tier first-stack bonus for nanites (2 stacks -> 2.0s regen delay at 115 HP/s)
   if (choiceId === "nanites" && taken === 0) {
     score += 5
+  }
+
+  // Armor multiplies EHP of rapid nanite healing (+6 if already holding nanites -> 128)
+  if (choiceId === "armor" && (takenCounts.get("nanites") ?? 0) > 0) {
+    score += 6
+  }
+
+  // First stack of sensors unlocks huge early-warning vision & proximity detection (+6 -> 112)
+  if (choiceId === "sensors" && taken === 0) {
+    score += 6
   }
 
   // Never pick an already-maxed upgrade over an available one

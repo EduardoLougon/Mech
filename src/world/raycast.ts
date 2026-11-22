@@ -95,6 +95,168 @@ export function surfaceZAt(world: WorldData, x: number, y: number, currentZ: num
   return bestZ
 }
 
+export function isPointWalkable(
+  world: WorldData,
+  x: number,
+  y: number,
+  currentZ: number,
+  mechRadius = 2.5,
+  mechHeight = 9.0,
+  maxSlopeDeg = 50,
+): boolean {
+  const { bounds, hash, prisms } = world
+  if (x < bounds.minX || x > bounds.maxX || y < bounds.minY || y > bounds.maxY) {
+    return false
+  }
+
+  const rOff = mechRadius > 0 ? mechRadius * 0.75 : 0
+  const maxBase = currentZ + mechHeight
+  const minTop = currentZ + 1.2
+  let onRoof = false
+
+  const cx0 = Math.max(0, Math.floor((x - rOff - hash.minX) / hash.cellSize))
+  const cx1 = Math.min(hash.nx - 1, Math.floor((x + rOff - hash.minX) / hash.cellSize))
+  const cy0 = Math.max(0, Math.floor((y - rOff - hash.minY) / hash.cellSize))
+  const cy1 = Math.min(hash.ny - 1, Math.floor((y + rOff - hash.minY) / hash.cellSize))
+
+  for (let cy = cy0; cy <= cy1; cy++) {
+    const row = cy * hash.nx
+    for (let cx = cx0; cx <= cx1; cx++) {
+      const cell = row + cx
+      const start = hash.prismOffsets[cell]
+      const end = hash.prismOffsets[cell + 1]
+      for (let idx = start; idx < end; idx++) {
+        const p = prisms[hash.prismIndices[idx]]
+
+        if (!onRoof && Math.abs(p.top - currentZ) <= 1.5 && pointInPrismXY(x, y, p)) {
+          onRoof = true
+        }
+
+        if (p.base <= maxBase && p.top > minTop) {
+          if (
+            x + rOff < p.minX ||
+            x - rOff > p.maxX ||
+            y + rOff < p.minY ||
+            y - rOff > p.maxY
+          ) {
+            continue
+          }
+          if (pointInPrismXY(x, y, p)) return false
+          if (rOff > 0) {
+            if (
+              pointInPrismXY(x + rOff, y, p) ||
+              pointInPrismXY(x - rOff, y, p) ||
+              pointInPrismXY(x, y + rOff, p) ||
+              pointInPrismXY(x, y - rOff, p)
+            ) {
+              return false
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!onRoof && slopeAt(world, x, y) > maxSlopeDeg) {
+    return false
+  }
+  return true
+}
+
+export function hasDirectWalkLine(
+  world: WorldData,
+  from: Vec3,
+  to: Vec3,
+  mechRadius = 2.5,
+  mechHeight = 9.0,
+  maxSlopeDeg = 50,
+): boolean {
+  const dx = to[0] - from[0]
+  const dy = to[1] - from[1]
+  const dist = Math.hypot(dx, dy)
+  if (dist < 1e-4) {
+    return isPointWalkable(world, to[0], to[1], to[2], mechRadius, mechHeight, maxSlopeDeg)
+  }
+
+  const steps = Math.max(1, Math.ceil(dist / 2.0))
+  let prevZ = from[2]
+  for (let s = 1; s <= steps; s++) {
+    const t = s / steps
+    const px = from[0] + dx * t
+    const py = from[1] + dy * t
+    const sz = surfaceZAt(world, px, py, prevZ)
+    if (Math.abs(sz - prevZ) > 1.25) return false
+    if (!isPointWalkable(world, px, py, sz, mechRadius, mechHeight, maxSlopeDeg)) {
+      return false
+    }
+    prevZ = sz
+  }
+  return true
+}
+
+const SNAP_RADII = [4, 8, 12, 16, 24, 32]
+const SNAP_ANGLE_COUNT = 12
+const SNAP_COS = new Float64Array(SNAP_ANGLE_COUNT)
+const SNAP_SIN = new Float64Array(SNAP_ANGLE_COUNT)
+for (let i = 0; i < SNAP_ANGLE_COUNT; i++) {
+  const angle = (i * Math.PI * 2) / SNAP_ANGLE_COUNT
+  SNAP_COS[i] = Math.cos(angle)
+  SNAP_SIN[i] = Math.sin(angle)
+}
+
+export function snapToWalkable(
+  world: WorldData,
+  x: number,
+  y: number,
+  currentZ: number,
+  mechRadius = 2.5,
+  maxSlopeDeg = 50,
+): Vec3 {
+  if (isPointWalkable(world, x, y, currentZ, mechRadius, 9.0, maxSlopeDeg)) {
+    return [x, y, surfaceZAt(world, x, y, currentZ)]
+  }
+
+  const { bounds } = world
+  const cx = Math.max(bounds.minX + 1, Math.min(bounds.maxX - 1, x))
+  const cy = Math.max(bounds.minY + 1, Math.min(bounds.maxY - 1, y))
+  if (cx !== x || cy !== y) {
+    const cz = surfaceZAt(world, cx, cy, currentZ)
+    if (isPointWalkable(world, cx, cy, cz, mechRadius, 9.0, maxSlopeDeg)) {
+      return [cx, cy, cz]
+    }
+  }
+
+  for (let rIdx = 0; rIdx < SNAP_RADII.length; rIdx++) {
+    const r = SNAP_RADII[rIdx]
+    let bestX = 0
+    let bestY = 0
+    let bestZ = 0
+    let bestDz = Infinity
+    let found = false
+
+    for (let k = 0; k < SNAP_ANGLE_COUNT; k++) {
+      const nx = cx + SNAP_COS[k] * r
+      const ny = cy + SNAP_SIN[k] * r
+      const nz = surfaceZAt(world, nx, ny, currentZ)
+      if (isPointWalkable(world, nx, ny, nz, mechRadius, 9.0, maxSlopeDeg)) {
+        const dz = Math.abs(nz - currentZ)
+        if (dz < bestDz) {
+          bestDz = dz
+          bestX = nx
+          bestY = ny
+          bestZ = nz
+          found = true
+        }
+      }
+    }
+    if (found) {
+      return [bestX, bestY, bestZ]
+    }
+  }
+
+  return [cx, cy, surfaceZAt(world, cx, cy, currentZ)]
+}
+
 function collectRingCrossings(
   ax: number,
   ay: number,

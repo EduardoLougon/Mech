@@ -19,26 +19,38 @@ run((hello) => {
   // Pre-warm JIT during hello budget
   const warmZ = world.heightAt(0, 0)
   world.hasShotLOS([0, 0, warmZ + 7], [40, 40, warmZ + 7])
-  world.findPath([0, 0, warmZ], [40, 40, warmZ], false)
+  world.findPath([0, 0, warmZ], [40, 40, warmZ], 0)
 
   const maxSlopeDeg = cfg.mech.max_slope_deg ?? 50
+  const baseRadius = cfg.mech.radius ?? 2.5
+  const baseHeight = cfg.mech.height ?? 9.0
+  const sizePerCube = (cfg.cubes.size_per_cube as number) ?? 0.05
 
   let cachedPath: Vec3[] = []
   let cachedGoal: Vec3 | null = null
   let lastPathTick = -100
   let stuckTicks = 0
   let stuckSide = 1
+  let anchorPos: Vec3 | null = null
+  let anchorTick = 0
+  let climbingTargetZ: number | null = null
+  let eaveStallTicks = 0
+  let eaveBackoffTicks = 0
+  let eaveBackoffDir: Vec2 = [0, 0]
 
   log(
-    `mech-hydra-v3 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
+    `mech-hydra-v4 ready in ${(performance.now() - tStart).toFixed(1)} ms (slot=${hello.slot})`,
   )
 
   return {
-    name: "mech-hydra-v3",
+    name: "mech-hydra-v4",
     act(obs: Observation): BotAction {
       const t0 = performance.now()
       const me = obs.self
       const [x, y, z] = me.pos
+      const sizeScale = 1 + sizePerCube * me.cubes
+      const mechRadius = me.stats.radius ?? baseRadius * sizeScale
+      const mechHeight = me.stats.height ?? baseHeight * sizeScale
 
       // 1. Perception & Threats
       const threats = perception.update(obs, world)
@@ -49,24 +61,31 @@ run((hello) => {
       // 3. Combat & Loot
       const combatAct = combat.act(obs, world, threats, order)
 
-      // 4. Navigation, Dodge Blending & Wall-Safe Local Steering
+      // 4. Navigation, Roof-Climb State Machine, Dodge & Wall-Safe Steering
       let move: Vec2 = [0, 0]
       let boost = false
       let jump = false
+      let activeClimb = false
 
       const goal = order.moveTarget
       let waypoint: Vec3 | null = goal
       if (goal) {
         const goalDist2 = Math.hypot(goal[0] - x, goal[1] - y)
+        const goalDz = Math.abs(goal[2] - z)
         const goalMoved =
           !cachedGoal ||
           Math.hypot(goal[0] - cachedGoal[0], goal[1] - cachedGoal[1]) > 8 ||
           Math.abs(goal[2] - cachedGoal[2]) > 3
 
-        // For short local strafe/peek targets (< 18m) with direct line, skip A* overhead
-        if (goalDist2 < 18 && Math.abs(goal[2] - z) < 2.0) {
+        // Only bypass A* if goal is close, same elevation, AND has verified wall-free direct line!
+        if (
+          goalDist2 < 18 &&
+          goalDz < 1.2 &&
+          world.hasDirectWalkLine(me.pos, goal, mechRadius, mechHeight)
+        ) {
           waypoint = goal
           cachedPath = []
+          cachedGoal = goal
         } else {
           const elapsed = performance.now() - t0
           if (
@@ -75,96 +94,194 @@ run((hello) => {
               obs.tick - lastPathTick >= PATH_RECOMPUTE_TICKS ||
               cachedPath.length === 0)
           ) {
-            const canJet = me.energy > 35
-            cachedPath = world.findPath(me.pos, goal, canJet)
+            const maxClimb = Math.max(0, Math.min(48, (me.energy - 16) / 1.5))
+            const wantRoof = goal[2] > world.heightAt(goal[0], goal[1]) + 2.5
+            cachedPath = world.findPath(me.pos, goal, maxClimb, wantRoof)
             cachedGoal = goal
             lastPathTick = obs.tick
           }
 
-          while (
-            cachedPath.length > 1 &&
-            Math.hypot(cachedPath[0][0] - x, cachedPath[0][1] - y) < 3.5 &&
-            Math.abs(cachedPath[0][2] - z) < 2.0
-          ) {
-            cachedPath.shift()
+          // Pop waypoints only when horizontally close AND feet actually cleared roof Z
+          while (cachedPath.length > 1) {
+            const wp = cachedPath[0]
+            const wpDist2 = Math.hypot(wp[0] - x, wp[1] - y)
+            const wpDz = wp[2] - z
+            const zCleared = wpDz <= 0.3 && wpDz >= -2.5
+            if (wpDist2 < 3.5 && zCleared) {
+              cachedPath.shift()
+            } else {
+              break
+            }
           }
           waypoint = cachedPath[0] ?? goal
         }
 
         const dx = waypoint[0] - x
         const dy = waypoint[1] - y
-        const d = Math.hypot(dx, dy)
-        if (d > 1e-4) move = [dx / d, dy / d]
+        const d2 = Math.hypot(dx, dy)
+        if (d2 > 1e-4) move = [dx / d2, dy / d2]
 
-        // Ledge/roof jump-jetting when energy can cover the climb
-        const dz = waypoint[2] - z
-        if (dz > 1.3 && me.energy >= Math.max(25, dz / 0.5 + 10)) {
+        // Dedicated Roof Climb Controller (Approach -> Launch -> Clear Edge -> Mantle -> Eave Escape)
+        const wpDz = waypoint[2] - z
+        if (eaveBackoffTicks > 0) {
+          eaveBackoffTicks--
+          move = eaveBackoffDir
+          boost = false
+          activeClimb = true
+        } else if (
+          climbingTargetZ !== null &&
+          z < climbingTargetZ + 0.5 &&
+          me.energy > 5 &&
+          d2 < 10
+        ) {
+          // Continue climbing until feet clear roof edge (+0.5m)
+          activeClimb = true
           if (me.grounded) jump = true
           else boost = true
+          // Eave/overhang stall detection (protocol.md §7)
+          if (!me.grounded && me.vel[2] < 1.5) {
+            eaveStallTicks++
+            if (eaveStallTicks >= 3) {
+              eaveBackoffTicks = 3
+              eaveBackoffDir = d2 > 1e-4 ? [-dx / d2, -dy / d2] : [1, 0]
+              eaveStallTicks = 0
+              climbingTargetZ = null
+            }
+          } else {
+            eaveStallTicks = 0
+          }
+        } else if (
+          wpDz > 1.2 &&
+          d2 <= 7.5 &&
+          me.energy >= 1.5 * wpDz + 14
+        ) {
+          // Start roof climb only once horizontally close to the edge
+          climbingTargetZ = waypoint[2]
+          activeClimb = true
+          eaveStallTicks = 0
+          if (me.grounded) jump = true
+          else boost = true
+        } else {
+          // Clear climb latch once landed on/above target or moved away
+          if (
+            climbingTargetZ !== null &&
+            (z >= climbingTargetZ - 0.2 || d2 >= 10 || me.energy <= 5)
+          ) {
+            climbingTargetZ = null
+            eaveStallTicks = 0
+          }
         }
+      } else {
+        climbingTargetZ = null
+        eaveStallTicks = 0
       }
 
       // Blend or override with projectile/laser dodge BEFORE local wall-avoidance steering
-      if (threats.dodgeUrgency > 0.55) {
-        move = threats.dodgeVec
-        if (me.energy > 15) boost = true
-      } else if (threats.dodgeUrgency > 0.2) {
-        const w = Math.min(0.85, threats.dodgeUrgency)
-        const mx = move[0] * (1 - w) + threats.dodgeVec[0] * w
-        const my = move[1] * (1 - w) + threats.dodgeVec[1] * w
-        const mag = Math.hypot(mx, my)
-        if (mag > 1e-4) move = [mx / mag, my / mag]
-        else move = threats.dodgeVec
+      if (!activeClimb) {
+        if (threats.dodgeUrgency > 0.55) {
+          move = threats.dodgeVec
+          if (me.grounded && me.energy > 15) boost = true
+        } else if (threats.dodgeUrgency > 0.2) {
+          const w = Math.min(0.85, threats.dodgeUrgency)
+          const mx = move[0] * (1 - w) + threats.dodgeVec[0] * w
+          const my = move[1] * (1 - w) + threats.dodgeVec[1] * w
+          const mag = Math.hypot(mx, my)
+          if (mag > 1e-4) move = [mx / mag, my / mag]
+          else move = threats.dodgeVec
+        }
       }
 
-      // Wall-safe local steering applied to the combined move vector
+      if (threats.wantJump && me.grounded) {
+        jump = true
+      }
+
+      // Wall-safe local steering applied AFTER dodge blending (bypassed during intentional roof mantle)
       const moveMagPreSteer = Math.hypot(move[0], move[1])
-      if (moveMagPreSteer > 1e-4) {
+      if (!activeClimb && moveMagPreSteer > 1e-4) {
         const steerTarget: Vec3 = [
           x + move[0] * 6,
           y + move[1] * 6,
           waypoint ? waypoint[2] : z,
         ]
-        move = computeLocalSteer(world, me.pos, steerTarget, maxSlopeDeg)
+        move = computeLocalSteer(
+          world,
+          me.pos,
+          steerTarget,
+          maxSlopeDeg,
+          mechRadius,
+          mechHeight,
+        )
       }
 
-      // Stuck detection & recovery (latches escape side cleanly)
+      // Stuck detection & recovery via actual net displacement (catches wall-grinding & steer oscillation)
       const moveMag = Math.hypot(move[0], move[1])
       const speed2d = Math.hypot(me.vel[0], me.vel[1])
-      if (moveMag > 0.3 && speed2d < 1.2) {
-        stuckTicks++
-        if (stuckTicks === 6) {
-          stuckSide = obs.tick % 2 === 0 ? 1 : -1
-          cachedPath = []
+      const goalDistForStuck = goal ? Math.hypot(goal[0] - x, goal[1] - y) : 0
+      if (!activeClimb && moveMag > 0.3 && goalDistForStuck > 4.0) {
+        if (!anchorPos) {
+          anchorPos = [x, y, z]
+          anchorTick = obs.tick
         }
-        if (stuckTicks >= 6) {
-          if (me.grounded) jump = true
-          if (me.energy > 20) boost = true
-          const ang = Math.atan2(move[1], move[0]) + stuckSide * 1.15
-          move = [Math.cos(ang), Math.sin(ang)]
+        const netMoved = Math.hypot(x - anchorPos[0], y - anchorPos[1])
+        const elapsedTicks = obs.tick - anchorTick
+        if (netMoved >= 3.0) {
+          anchorPos = [x, y, z]
+          anchorTick = obs.tick
+          stuckTicks = 0
+        } else if (speed2d < 1.2 || elapsedTicks >= 24) {
+          stuckTicks++
+          if (stuckTicks === 6) {
+            stuckSide = obs.tick % 2 === 0 ? 1 : -1
+            cachedPath = []
+          }
+          if (stuckTicks >= 6) {
+            const ang = Math.atan2(move[1], move[0]) + stuckSide * 1.35
+            move = [Math.cos(ang), Math.sin(ang)]
+            if (stuckTicks >= 12) {
+              // If lateral slide failed for 0.6s (e.g. courtyard hole / sunken ledge), jump-jet out!
+              if (me.grounded) jump = true
+              else if (me.energy > 15) boost = true
+            } else if (me.grounded && me.energy > 25) {
+              boost = true
+            }
+            if (stuckTicks >= 24) {
+              anchorPos = [x, y, z]
+              anchorTick = obs.tick
+              stuckSide = -stuckSide
+              stuckTicks = 6
+            }
+          }
         }
       } else {
+        anchorPos = null
         stuckTicks = 0
       }
 
-      // Smart boost policy: sprint when out of zone, retreating to cover, or contesting drop
-      if (!me.in_zone && me.energy > 12) {
-        boost = true
-      } else if (order.mode === "zone_sprint" && me.energy > 35) {
-        boost = true
-      } else if (
-        order.mode === "regen_hide" &&
-        threats.spottedByCount > 0 &&
-        me.energy > 20
-      ) {
-        boost = true
-      } else if (
-        (order.mode === "contest_drop" || order.mode === "farm_crate") &&
-        goal &&
-        Math.hypot(goal[0] - x, goal[1] - y) > 25 &&
-        me.energy > 65
-      ) {
-        boost = true
+      // Smart boost policy: ALWAYS gate sprint boost on `me.grounded` so we never accidentally sky-jet!
+      if (!activeClimb && me.grounded) {
+        if (!me.in_zone && me.energy > 12) {
+          boost = true
+        } else if (order.mode === "zone_sprint" && me.energy > 35) {
+          boost = true
+        } else if (
+          order.mode === "regen_hide" &&
+          threats.spottedByCount > 0 &&
+          me.energy > 18
+        ) {
+          boost = true
+        } else if (
+          threats.chargingLaserThreat &&
+          me.energy > 18
+        ) {
+          boost = true
+        } else if (
+          (order.mode === "contest_drop" || order.mode === "farm_crate") &&
+          goal &&
+          Math.hypot(goal[0] - x, goal[1] - y) > 25 &&
+          me.energy > 65
+        ) {
+          boost = true
+        }
       }
 
       const act: BotAction = {
@@ -179,7 +296,7 @@ run((hello) => {
         draw.point(goal, "#40c0ff", 5)
       }
       draw.label(
-        `v3 ${order.mode} cubes=${me.cubes} hp=${me.hp.toFixed(0)}`,
+        `v4 ${order.mode} c=${me.cubes} hp=${me.hp.toFixed(0)}`,
       )
 
       return act

@@ -4,13 +4,22 @@ import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { performance } from "node:perf_hooks"
 import { createWorld } from "../src/world/index.ts"
+import { createPerception } from "../src/perception/index.ts"
+import { chooseWeaponAction, createCombat, solveDirectAim } from "../src/combat/index.ts"
 import { pickUpgrade } from "../src/strategy/upgrades.ts"
 import {
   DEFAULT_CONFIG,
   computeActiveHunterIds,
   getHouseBotProfile,
 } from "../sim/arena_sim.ts"
-import type { Observation, Vec2, Vec3, WorldQuery } from "../src/contracts.ts"
+import type {
+  MacroOrder,
+  Observation,
+  ThreatState,
+  Vec2,
+  Vec3,
+  WorldQuery,
+} from "../src/contracts.ts"
 
 const ARENA_DIR = resolve("mechfight-kit/arena")
 
@@ -323,11 +332,11 @@ test("WorldQuery findPeekCover returns valid peek position (or null cleanly) and
   assert.equal(world.findPeekCover(origin, dummyTarget, [], 30), null)
   assert.equal(world.findPeekCover(origin, dummyTarget, [[220, -100, world.heightAt(220, -100)]], 0), null)
 
-  // Near eastern side of a tall building (base -0.33, top 22.12, x in [301.4, 313.6], y in [-245, -236.8]):
-  // Target is visible to the east; secondary threat is on the western side behind the 22m building.
-  const pos: Vec3 = [320, -241, world.heightAt(320, -241)]
-  const targetPos: Vec3 = [350, -241, world.heightAt(350, -241)]
-  const otherThreat: Vec3 = [290, -241, world.heightAt(290, -241)]
+  // Near western exterior of a 15.2m building (prism 65: base -1.35, top 15.23, x in [-10.3, 26.5], y in [-126, -91]):
+  // Target is visible to the west; secondary threat is on the eastern side behind the 15.2m building.
+  const pos: Vec3 = [-18.3, -108.5, world.heightAt(-18.3, -108.5)]
+  const targetPos: Vec3 = [-42, -108.5, world.heightAt(-42, -108.5)]
+  const otherThreat: Vec3 = [34.5, -108.5, world.heightAt(34.5, -108.5)]
 
   const peek = world.findPeekCover(pos, targetPos, [otherThreat], 35)
   assert.ok(peek !== null, "Expected findPeekCover to find a valid peek position behind tall building")
@@ -541,4 +550,324 @@ test("DEFAULT_CONFIG upgrades and 1v15 Practice hunter activation match v3 rules
   assert.deepEqual([...lateTime], midAlive)
   const lateZone = computeActiveHunterIds(midAlive, 4, 100, 140)
   assert.deepEqual([...lateZone], midAlive)
+})
+
+// --- v4 Regression Tests ---
+
+test("v4 WorldQuery isPointWalkable & hasDirectWalkLine reject building interiors/walls and accept Oval ground + flat rooftops", () => {
+  const world = getWorld()
+
+  // 1. Open Oval ground is walkable and has a direct walk line
+  const ovalA: Vec3 = [250, -100, world.heightAt(250, -100)]
+  const ovalMid: Vec3 = [275, -100, world.heightAt(275, -100)]
+  const ovalB: Vec3 = [290, -100, world.heightAt(290, -100)]
+  assert.equal(
+    world.isPointWalkable(ovalMid[0], ovalMid[1], ovalMid[2]),
+    true,
+    "Open Oval ground should be walkable"
+  )
+  assert.equal(
+    world.hasDirectWalkLine(ovalA, ovalB),
+    true,
+    "Open Oval straight line should have direct walk clearance"
+  )
+
+  // 2. Solid building interior & walls are rejected (prism 65: x in [-10.3, 26.5], y in [-126, -91], base -1.35, top 15.23)
+  const bldgGroundZ = world.heightAt(8.1, -108.5)
+  assert.equal(
+    world.isPointWalkable(8.1, -108.5, bldgGroundZ),
+    false,
+    "Solid building interior at ground level must not be walkable"
+  )
+  const westExt: Vec3 = [-18.3, -108.5, world.heightAt(-18.3, -108.5)]
+  const eastExt: Vec3 = [34.5, -108.5, world.heightAt(34.5, -108.5)]
+  assert.equal(
+    world.hasDirectWalkLine(westExt, eastExt),
+    false,
+    "Walk line piercing a solid building must be rejected"
+  )
+
+  // 3. Flat rooftop (prism 65, top 15.23) is accepted for both point and direct walk line
+  assert.equal(
+    world.isPointWalkable(8.1, -108.5, 15.23),
+    true,
+    "Wide flat rooftop center should be walkable"
+  )
+  assert.equal(
+    world.hasDirectWalkLine([4, -108.5, 15.23], [12, -108.5, 15.23]),
+    true,
+    "Walk line across flat rooftop should be accepted"
+  )
+
+  // 4. Flat rooftop over steep underlying terrain bypasses slopeAt (prism 57 at (-137, -60), top 14.71, terrain slope ~54 deg > 50 deg)
+  const underlyingSlope = world.slopeAt(-137, -60)
+  assert.ok(
+    underlyingSlope > 50,
+    `Expected underlying terrain slope at (-137, -60) to exceed 50 deg, got ${underlyingSlope.toFixed(1)}`
+  )
+  assert.equal(
+    world.isPointWalkable(-137, -60, 14.71),
+    true,
+    "Flat rooftop must remain walkable even when underlying terrain slopeAt exceeds max_slope_deg"
+  )
+  assert.equal(
+    world.hasDirectWalkLine([-137, -66, 14.71], [-137, -56, 14.71]),
+    true,
+    "Direct walk line across flat rooftop must bypass underlying steep terrain slopeAt"
+  )
+})
+
+test("v4 WorldQuery findCover allows distSq === 0 when already hidden and returns null in open terrain", () => {
+  const world = getWorld()
+
+  // 1. Already hidden behind prism 65 (top 15.23) from east-side threat -> stay put (no ping-pong)
+  const hiddenPos: Vec3 = [-18.3, -108.5, world.heightAt(-18.3, -108.5)]
+  const eastThreat: Vec3 = [34.5, -108.5, world.heightAt(34.5, -108.5)]
+  assert.equal(
+    world.hasShotLOS(
+      [eastThreat[0], eastThreat[1], eastThreat[2] + 8],
+      [hiddenPos[0], hiddenPos[1], hiddenPos[2] + 8]
+    ),
+    false,
+    "Test setup: hiddenPos must already be blocked from eastThreat by prism 65"
+  )
+
+  const cover1 = world.findCover(hiddenPos, [eastThreat], 20)
+  assert.ok(cover1 !== null, "findCover should return a valid cover cell when already hidden")
+  if (cover1 !== null) {
+    assert.ok(
+      Math.hypot(cover1[0] - hiddenPos[0], cover1[1] - hiddenPos[1]) < 4,
+      `Expected already-hidden cover cell near start (< 4m), got ${Math.hypot(cover1[0] - hiddenPos[0], cover1[1] - hiddenPos[1]).toFixed(2)}m`
+    )
+    assert.equal(
+      world.hasShotLOS(
+        [eastThreat[0], eastThreat[1], eastThreat[2] + 8],
+        [cover1[0], cover1[1], cover1[2] + 8]
+      ),
+      false,
+      "Returned cover cell must remain blocked from threat"
+    )
+
+    // Re-querying from the returned navgrid cell center must select distSq === 0 (zero ping-pong)
+    const cover2 = world.findCover(cover1, [eastThreat], 20)
+    assert.ok(cover2 !== null, "Re-querying findCover from already-hidden cell should not return null")
+    if (cover2 !== null) {
+      const shift = Math.hypot(cover2[0] - cover1[0], cover2[1] - cover1[1])
+      assert.ok(
+        shift < 0.5,
+        `findCover ping-ponged by ${shift.toFixed(2)}m instead of allowing distSq === 0`
+      )
+    }
+  }
+
+  // 2. Wide-open Oval terrain where no reachable cell reduces exposure -> must return null
+  const openPos: Vec3 = [275, -100, world.heightAt(275, -100)]
+  const openThreat: Vec3 = [295, -100, world.heightAt(295, -100)]
+  assert.equal(
+    world.hasShotLOS(
+      [openThreat[0], openThreat[1], openThreat[2] + 8],
+      [openPos[0], openPos[1], openPos[2] + 8]
+    ),
+    true,
+    "Test setup: openPos must be exposed to openThreat in the Oval"
+  )
+  assert.equal(
+    world.findCover(openPos, [openThreat], 16),
+    null,
+    "findCover must return null in open terrain when no cell reduces exposure"
+  )
+})
+
+test("v4 WorldQuery findRooftopSpot finds a valid wide safe-zone rooftop (10-28m above terrain)", () => {
+  const world = getWorld()
+
+  const zoneCenter: Vec2 = [41.3, -72.8]
+  const zoneRadius = 250
+  const maxDist = 180
+  const startPos: Vec3 = [zoneCenter[0], zoneCenter[1], world.heightAt(zoneCenter[0], zoneCenter[1])]
+
+  const spot = world.findRooftopSpot(startPos, zoneCenter, zoneRadius, maxDist, [])
+  assert.ok(spot !== null, "Expected findRooftopSpot to locate a wide safe-zone rooftop on the real arena")
+  if (spot !== null) {
+    assert.ok(
+      Number.isFinite(spot[0]) && Number.isFinite(spot[1]) && Number.isFinite(spot[2]),
+      "Rooftop spot coordinates must be finite"
+    )
+    const distFromZone = Math.hypot(spot[0] - zoneCenter[0], spot[1] - zoneCenter[1])
+    assert.ok(
+      distFromZone <= zoneRadius,
+      `Rooftop spot (${spot[0]}, ${spot[1]}) is outside safe zone (dist ${distFromZone.toFixed(1)} > ${zoneRadius})`
+    )
+    const distFromStart = Math.hypot(spot[0] - startPos[0], spot[1] - startPos[1])
+    assert.ok(
+      distFromStart <= maxDist + 4,
+      `Rooftop spot exceeded maxDist (${distFromStart.toFixed(1)} > ${maxDist})`
+    )
+
+    const terrainZ = world.heightAt(spot[0], spot[1])
+    const heightAboveTerrain = spot[2] - terrainZ
+    assert.ok(
+      heightAboveTerrain >= 10 && heightAboveTerrain <= 28,
+      `Expected rooftop height 10-28m above terrain, got ${heightAboveTerrain.toFixed(2)}m`
+    )
+    assert.equal(
+      world.isPointWalkable(spot[0], spot[1], spot[2]),
+      true,
+      "Returned rooftop spot must be walkable"
+    )
+  }
+
+  // Open Oval with tiny safe zone (no buildings within 35m) returns null cleanly
+  const ovalPos: Vec3 = [275, -100, world.heightAt(275, -100)]
+  assert.equal(
+    world.findRooftopSpot(ovalPos, [275, -100], 25, 25, []),
+    null,
+    "findRooftopSpot should return null when no rooftop exists in the safe zone"
+  )
+})
+
+test("v4 createPerception initializes sound ghosts with hp === 1400 (not 100)", () => {
+  const world = getWorld()
+  const perception = createPerception(DEFAULT_CONFIG)
+
+  const obs = makeUpgradeObs(null)
+  obs.self.pos = [275, -100, world.heightAt(275, -100)]
+  obs.mechs = []
+  obs.sounds = [
+    { kind: "gun", bearing: 0.5, dist: "mid", age: 0.05 },
+    { kind: "step", bearing: -1.8, dist: "near", age: 0.05 },
+  ]
+
+  const threats = perception.update(obs, world)
+  const ghosts = threats.enemies.filter((e) => e.id < 0)
+  assert.equal(ghosts.length, 2, `Expected 2 sound ghosts, got ${ghosts.length}`)
+  for (const ghost of ghosts) {
+    assert.equal(
+      ghost.hp,
+      1400,
+      `Sound ghost hp should initialize to 1400 (not 100), got ${ghost.hp}`
+    )
+    assert.equal(
+      ghost.maxHp,
+      1400,
+      `Sound ghost maxHp should initialize to 1400, got ${ghost.maxHp}`
+    )
+  }
+})
+
+test("v4 createCombat fires gun at cooldown === 0.09 and does not force-reload at ammo === 3 with LOS enemy", () => {
+  const world = getWorld()
+  const combat = createCombat(DEFAULT_CONFIG)
+
+  const selfPos: Vec3 = [250, -100, world.heightAt(250, -100)]
+  const enemyPos: Vec3 = [310, -100, world.heightAt(310, -100)]
+  const muzzle: Vec3 = [selfPos[0], selfPos[1], selfPos[2] + 7]
+  const enemyCenter: Vec3 = [enemyPos[0], enemyPos[1], enemyPos[2] + 4.5]
+  assert.equal(world.hasShotLOS(muzzle, enemyCenter), true, "Test setup: enemy must be in clear LOS")
+
+  const alignedAim = solveDirectAim(muzzle, enemyCenter)
+
+  const makeCombatObs = (cooldown: number, ammo: number): Observation => {
+    const obs = makeUpgradeObs(null)
+    obs.self.pos = selfPos
+    obs.self.aim = [alignedAim[0], alignedAim[1]]
+    obs.self.weapons = [
+      {
+        kind: "gun",
+        cooldown,
+        ammo,
+        reload: 0,
+        stats: { ...DEFAULT_CONFIG.weapons.gun },
+      },
+      null,
+    ]
+    obs.mechs = [
+      {
+        id: 2,
+        kind: "mech",
+        pos: enemyPos,
+        vel: [0, 0, 0],
+        aim: [Math.PI, 0],
+        hp: 1400,
+        max_hp: 1400,
+        cubes: 0,
+        weapons: ["gun"],
+        charging: false,
+      },
+    ]
+    return obs
+  }
+
+  const threats: ThreatState = {
+    enemies: [
+      {
+        id: 2,
+        kind: "mech",
+        pos: enemyPos,
+        vel: [0, 0, 0],
+        aim: [Math.PI, 0],
+        hp: 1400,
+        maxHp: 1400,
+        cubes: 0,
+        weapons: ["gun"],
+        charging: false,
+        lastSeenT: 5.0,
+        confidence: 1.0,
+      },
+    ],
+    dodgeVec: [0, 0],
+    dodgeUrgency: 0,
+    wantJump: false,
+    chargingLaserThreat: false,
+    primaryThreatBearing: alignedAim[0],
+    spottedByCount: 1,
+    ffaConfidence: 0.5,
+  }
+
+  const order: MacroOrder = {
+    mode: "engage",
+    moveTarget: enemyPos,
+    primaryTargetId: 2,
+    desiredLoadout: ["laser", "gun"],
+    preferSilent: false,
+    holdFireForRegen: false,
+  }
+
+  // 1. Tick quantization fix: fires when cooldown === 0.09 (<= 0.10)
+  const obsTickQuant = makeCombatObs(0.09, 8)
+  const actTickQuant = combat.act(obsTickQuant, world, threats, order)
+  assert.equal(
+    actTickQuant.fire?.[0],
+    true,
+    "Gun should fire when w.cooldown === 0.09 (<= 0.10 tick quantization threshold)"
+  )
+  assert.equal(Boolean(actTickQuant.reload), false, "Gun should not reload at ammo === 8")
+
+  // 2. Must NOT force-reload at ammo === 3 when enemy target is in LOS (60m away) and cooldown === 0.09
+  const obsAmmo3Ready = makeCombatObs(0.09, 3)
+  const actAmmo3Ready = combat.act(obsAmmo3Ready, world, threats, order)
+  assert.equal(
+    actAmmo3Ready.fire?.[0],
+    true,
+    "Gun should fire at ammo === 3 with LOS enemy and cooldown === 0.09"
+  )
+  assert.equal(
+    Boolean(actAmmo3Ready.reload),
+    false,
+    "Gun must NOT force-reload at ammo === 3 when an enemy target is in LOS"
+  )
+
+  // Also verify chooseWeaponAction directly
+  const weaponAct = chooseWeaponAction(obsAmmo3Ready, DEFAULT_CONFIG, world, threats, order)
+  assert.equal(weaponAct.fire[0], true, "chooseWeaponAction should fire gun at cooldown === 0.09, ammo === 3")
+  assert.equal(Boolean(weaponAct.reload), false, "chooseWeaponAction must not force-reload at ammo === 3 with LOS enemy")
+
+  // 3. Even while mid-cooldown (0.18s > 0.10s), must NOT force-reload at ammo === 3 when enemy is in LOS
+  const obsAmmo3Cooling = makeCombatObs(0.18, 3)
+  const actAmmo3Cooling = combat.act(obsAmmo3Cooling, world, threats, order)
+  assert.equal(
+    Boolean(actAmmo3Cooling.reload),
+    false,
+    "Gun must NOT force-reload during cooldown at ammo === 3 when an enemy target is in LOS"
+  )
 })

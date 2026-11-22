@@ -1,7 +1,7 @@
 import type { Config, MacroOrder, Observation, ThreatState, WorldQuery } from "../contracts.ts"
 import type { BotAction } from "../mechfight.ts"
 import { chooseLootAction } from "./loot.ts"
-import { chooseWeaponAction } from "./weapons.ts"
+import { chooseWeaponAction, createCombatWeaponState } from "./weapons.ts"
 
 export interface CombatController {
   act(
@@ -15,22 +15,23 @@ export interface CombatController {
 export function createCombat(config: Config): CombatController {
   const cookoffDroppedIds = new Set<number>()
   let lastCookoffDropTick = -100
+  const weaponState = createCombatWeaponState()
 
   return {
     act(obs, world, threats, order): Partial<BotAction> {
-      // Record the pickup ID of a mortar we just dropped due to cookoff so we don't immediately re-take it
+      // Record the pickup ID of a mortar we just dropped due to cookoff/proactive guard so we don't re-take it
       for (const ev of obs.events) {
         if (
           ev.type === "dropped" &&
           ev.kind === "mortar" &&
-          obs.tick - lastCookoffDropTick <= 4
+          obs.tick - lastCookoffDropTick <= 6
         ) {
           cookoffDroppedIds.add(ev.id)
         }
       }
 
-      const weaponAct = chooseWeaponAction(obs, config, world, threats, order)
-      const lootAct = chooseLootAction(obs, config, threats, order, cookoffDroppedIds)
+      const weaponAct = chooseWeaponAction(obs, config, world, threats, order, weaponState)
+      const lootAct = chooseLootAction(obs, config, threats, order, cookoffDroppedIds, world)
 
       if (
         lootAct.drop !== undefined &&
@@ -52,7 +53,8 @@ export function createCombat(config: Config): CombatController {
 }
 
 export { chooseLootAction } from "./loot.ts"
-export { chooseWeaponAction } from "./weapons.ts"
+export { chooseWeaponAction, createCombatWeaponState } from "./weapons.ts"
+export type { CombatWeaponState } from "./weapons.ts"
 export {
   aimDiff,
   idleAim,

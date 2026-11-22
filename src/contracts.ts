@@ -21,17 +21,46 @@ export interface WorldQuery {
   hasVisionLOS(a: Vec3, b: Vec3): boolean
   /** Return walkable/jettable surface Z at (x, y), or terrain Z if no roof/bridge. */
   surfaceZAt(x: number, y: number, currentZ: number): number
+  /** True if a mech cylinder at (x, y, currentZ) is clear of blocking prisms/overhangs and steep terrain slopes. */
+  isPointWalkable(
+    x: number,
+    y: number,
+    currentZ: number,
+    mechRadius?: number,
+    mechHeight?: number,
+  ): boolean
+  /** True if a straight horizontal walk segment from `from` to `to` is free of walls/ledges/steep slopes. */
+  hasDirectWalkLine(
+    from: Vec3,
+    to: Vec3,
+    mechRadius?: number,
+    mechHeight?: number,
+  ): boolean
+  /** Snap an arbitrary (x, y) (e.g. clamped zone point) out of solid buildings to the nearest walkable cell. */
+  snapToWalkable(
+    x: number,
+    y: number,
+    currentZ: number,
+    mechRadius?: number,
+  ): Vec3
   /** Find a path of waypoints from `from` to `to` on the 4m navgrid (node-capped). */
-  findPath(from: Vec3, to: Vec3, canJet: boolean): Vec3[]
-  /** Find a nearby cover position within `radius` that blocks shot LOS from `threats` and satisfies optional `isSafe(x, y)`. */
+  findPath(
+    from: Vec3,
+    to: Vec3,
+    canJetOrMaxClimb: boolean | number,
+    wantRoof?: boolean,
+  ): Vec3[]
+  /** Find a nearby BFS-reachable cover position within `radius` that blocks shot LOS from `threats`. Returns null if no cell reduces exposure. */
   findCover(
     pos: Vec3,
     threats: Vec3[],
     radius: number,
     isSafe?: (x: number, y: number) => boolean,
     eyeHeight?: number,
+    prevCover?: Vec3 | null,
+    mechRadius?: number,
   ): Vec3 | null
-  /** Find a "slice-the-pie" corner cell within `radius` that HAS shot LOS to `targetPos` while blocking shot LOS from `otherThreats`. */
+  /** Find a BFS-reachable "slice-the-pie" corner cell within `radius` that HAS shot LOS to `targetPos` while blocking shot LOS from `otherThreats`. */
   findPeekCover(
     pos: Vec3,
     targetPos: Vec3,
@@ -39,6 +68,16 @@ export interface WorldQuery {
     radius: number,
     isSafe?: (x: number, y: number) => boolean,
     eyeHeight?: number,
+    prevCover?: Vec3 | null,
+    mechRadius?: number,
+  ): Vec3 | null
+  /** Find a defensible safe-zone rooftop (10-26m sweet-spot height, wide area, penthouse bonus) within `maxDist`. */
+  findRooftopSpot(
+    pos: Vec3,
+    zoneCenter: Vec2,
+    zoneRadius: number,
+    maxDist: number,
+    threats: Vec3[],
   ): Vec3 | null
 }
 
@@ -64,9 +103,13 @@ export interface ThreatState {
   dodgeVec: Vec2
   /** Urgency of dodge in [0, 1]. */
   dodgeUrgency: number
+  /** True when a late anti-laser juke recommends jumping. */
+  wantJump: boolean
+  /** True when an enemy laser is actively charging at us (or laser_charge heard nearby). */
+  chargingLaserThreat: boolean
   /** World-frame yaw toward highest threat (to protect rear 180-deg armor arc), or null. */
   primaryThreatBearing: number | null
-  /** Number of enemies likely able to see or converge on us right now. */
+  /** Number of enemies likely able to see or shoot us right now. */
   spottedByCount: number
   /** 0 = likely 1v15 Practice, 1 = likely 16-mech FFA. */
   ffaConfidence: number
