@@ -1,0 +1,29 @@
+name: Mech Royale CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  docker-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check repository size <= 20 MB
+        run: |
+          SIZE_BYTES=$(git ls-files -z | xargs -0 stat -c%s | awk '{s+=$1} END {print s}')
+          echo "Tracked files size: $SIZE_BYTES bytes"
+          test "$SIZE_BYTES" -le 20971520
+
+      - name: Build linux/amd64 Docker image
+        run: docker build -t my-bot .
+
+      - name: Run sandboxed check.py (1 CPU, 512MB, read-only, uid 65534, no network)
+        run: |
+          python3 mechfight-kit/check/check.py --map-dir /arena -- \
+            docker run --rm -i --network none --cpus 1 --memory 512m \
+            --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 \
+            -v "$PWD/mechfight-kit/arena:/arena:ro" my-bot

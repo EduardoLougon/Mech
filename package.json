@@ -1,0 +1,16 @@
+{
+  "name": "mech-royale-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --outfile=dist/bot.js",
+    "build:sim": "esbuild sim/arena_sim.ts --bundle --platform=node --format=esm --outfile=dist/sim.js",
+    "check": "npm run build && uv run python mechfight-kit/check/check.py -- node dist/bot.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
