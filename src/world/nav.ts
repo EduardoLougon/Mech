@@ -1,11 +1,10 @@
-import type { Vec2, Vec3 } from "../contracts.ts"
+import type { Vec3 } from "../contracts.ts"
 import type { WorldData } from "./loader.ts"
 import {
-  hasVisionLOS,
+  hasShotLOS,
   heightAt,
   pointInPrismXY,
   slopeAt,
-  surfaceZAt,
   type RaycastScratch,
 } from "./raycast.ts"
 
@@ -38,14 +37,70 @@ export interface NavGrid {
   cellSlope: Float32Array
   cellBlocked: Uint8Array
   cellNearCover: Uint8Array
+  cellTight: Uint8Array
   // Preallocated A* scratch
   gScore: Float32Array
+  nodeZ: Float32Array
   parent: Int32Array
   openStamp: Int32Array
   closedStamp: Int32Array
   heapNode: Int32Array
   heapF: Float32Array
   stamp: number
+}
+
+const CLEARANCE_OFFSETS = [
+  [2.5, 0],
+  [-2.5, 0],
+  [0, 2.5],
+  [0, -2.5],
+  [1.77, 1.77],
+  [1.77, -1.77],
+  [-1.77, 1.77],
+  [-1.77, -1.77],
+] as const
+
+function hasBlockingPrismWithin(
+  world: WorldData,
+  wx: number,
+  wy: number,
+  tz: number,
+): boolean {
+  const { hash, prisms } = world
+  const hCx = Math.floor((wx - hash.minX) / hash.cellSize)
+  const hCy = Math.floor((wy - hash.minY) / hash.cellSize)
+  const maxReachable = tz + 1.2
+  const maxBase = tz + 9.0
+
+  for (let dy = -1; dy <= 1; dy++) {
+    const cy = hCy + dy
+    if (cy < 0 || cy >= hash.ny) continue
+    for (let dx = -1; dx <= 1; dx++) {
+      const cx = hCx + dx
+      if (cx < 0 || cx >= hash.nx) continue
+      const hCell = cy * hash.nx + cx
+      const start = hash.prismOffsets[hCell]
+      const end = hash.prismOffsets[hCell + 1]
+      for (let pPtr = start; pPtr < end; pPtr++) {
+        const p = prisms[hash.prismIndices[pPtr]]
+        if (p.base > maxBase || p.top <= maxReachable) continue
+        if (
+          wx < p.minX - 2.5 ||
+          wx > p.maxX + 2.5 ||
+          wy < p.minY - 2.5 ||
+          wy > p.maxY + 2.5
+        ) {
+          continue
+        }
+        for (let k = 0; k < CLEARANCE_OFFSETS.length; k++) {
+          const ox = wx + CLEARANCE_OFFSETS[k][0]
+          const oy = wy + CLEARANCE_OFFSETS[k][1]
+          if (pointInPrismXY(ox, oy, p)) return true
+        }
+      }
+    }
+  }
+  return false
 }
 
 export function buildNavGrid(world: WorldData, maxSlopeDeg: number): NavGrid {
@@ -60,6 +115,7 @@ export function buildNavGrid(world: WorldData, maxSlopeDeg: number): NavGrid {
   const cellSlope = new Float32Array(total)
   const cellBlocked = new Uint8Array(total)
   const cellNearCover = new Uint8Array(total)
+  const cellTight = new Uint8Array(total)
 
   const { hash, prisms } = world
 
@@ -102,21 +158,46 @@ export function buildNavGrid(world: WorldData, maxSlopeDeg: number): NavGrid {
   }
 
   for (let gy = 1; gy < ny - 1; gy++) {
+    const wy = minY + (gy + 0.5) * NAV_STEP
     const row = gy * nx
     for (let gx = 1; gx < nx - 1; gx++) {
       const idx = row + gx
       if (cellBlocked[idx]) {
         cellNearCover[idx] = 1
+        cellTight[idx] = 1
         continue
       }
-      let hasWall = 0
+      let hasAdjWall = 0
       for (let d = 0; d < 8; d++) {
         if (cellBlocked[(gy + DY[d]) * nx + (gx + DX[d])]) {
-          hasWall = 1
+          hasAdjWall = 1
           break
         }
       }
-      cellNearCover[idx] = hasWall
+      if (hasAdjWall) {
+        cellNearCover[idx] = 1
+        const wx = minX + (gx + 0.5) * NAV_STEP
+        if (hasBlockingPrismWithin(world, wx, wy, cellZ[idx])) {
+          cellTight[idx] = 1
+        }
+        continue
+      }
+      // Also mark cells within 2 cells (8m) of a blocked cell as near cover
+      let hasNearWall = 0
+      const y0 = Math.max(0, gy - 2)
+      const y1 = Math.min(ny - 1, gy + 2)
+      const x0 = Math.max(0, gx - 2)
+      const x1 = Math.min(nx - 1, gx + 2)
+      for (let ny2 = y0; ny2 <= y1 && !hasNearWall; ny2++) {
+        const r2 = ny2 * nx
+        for (let nx2 = x0; nx2 <= x1; nx2++) {
+          if (cellBlocked[r2 + nx2]) {
+            hasNearWall = 1
+            break
+          }
+        }
+      }
+      cellNearCover[idx] = hasNearWall
     }
   }
 
@@ -132,7 +213,9 @@ export function buildNavGrid(world: WorldData, maxSlopeDeg: number): NavGrid {
     cellSlope,
     cellBlocked,
     cellNearCover,
+    cellTight,
     gScore: new Float32Array(total),
+    nodeZ: new Float32Array(total),
     parent: new Int32Array(total),
     openStamp: new Int32Array(total),
     closedStamp: new Int32Array(total),
@@ -232,7 +315,9 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
     cellSlope,
     cellBlocked,
     cellNearCover,
+    cellTight,
     gScore,
+    nodeZ,
     parent,
     openStamp,
     closedStamp,
@@ -244,6 +329,12 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
   const targetIdx = ty * nx + tx
 
   gScore[startIdx] = 0
+  nodeZ[startIdx] =
+    from[2] > cellZ[startIdx] + 1.5
+      ? cellRoofZ[startIdx] > cellZ[startIdx] + 1.5
+        ? cellRoofZ[startIdx]
+        : from[2]
+      : cellZ[startIdx]
   parent[startIdx] = -1
   openStamp[startIdx] = stamp
 
@@ -270,7 +361,8 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
     expansions++
     const ux = u % nx
     const uy = (u / nx) | 0
-    const zU = canJet && cellBlocked[u] ? cellRoofZ[u] : cellZ[u]
+    const zU = nodeZ[u]
+    const onElevatedU = zU > cellZ[u] + 1.5
     const gU = gScore[u]
 
     for (let d = 0; d < 8; d++) {
@@ -281,16 +373,20 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
       if (closedStamp[v] === stamp) continue
 
       const blockedV = cellBlocked[v] === 1
-      if (!canJet && blockedV) continue
+      const roofV = cellRoofZ[v]
+      const hasRoofV = roofV > cellZ[v] + 1.5
+      const canWalkElevatedV = onElevatedU && hasRoofV && roofV - zU <= 1.5
+
+      if (!canJet && blockedV && !canWalkElevatedV) continue
 
       // Prevent diagonal corner cutting across solid buildings
-      if (d >= 4 && !canJet) {
+      if (d >= 4 && !canJet && !canWalkElevatedV) {
         if (cellBlocked[uy * nx + vx] || cellBlocked[vy * nx + ux]) continue
       }
 
       let extraCost = 0
       const slopeV = cellSlope[v]
-      if (!blockedV && slopeV > maxSlopeDeg) {
+      if (!blockedV && !canWalkElevatedV && slopeV > maxSlopeDeg) {
         if (!canJet) {
           if (u !== startIdx) continue
           extraCost += STEP_DIST[d] * 4
@@ -299,22 +395,29 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
         }
       }
 
-      const zV = canJet && blockedV ? cellRoofZ[v] : cellZ[v]
+      const zV = canWalkElevatedV
+        ? roofV
+        : canJet && blockedV
+          ? roofV
+          : cellZ[v]
       const dz = zV - zU
       if (canJet) {
-        if (dz > 50) continue
+        if (dz > 25) continue
         if (dz > 1.5) extraCost += dz * 1.5
       } else if (dz > 4.5 && u !== startIdx) {
         continue
       }
 
       if (cellNearCover[v] === 0) {
-        extraCost += STEP_DIST[d] * 0.35
+        extraCost += STEP_DIST[d] * 1.2
+      } else if (!blockedV && cellTight[v] === 1) {
+        extraCost += STEP_DIST[d] * 0.8
       }
 
       const tentativeG = gU + STEP_DIST[d] + extraCost
       if (openStamp[v] !== stamp || tentativeG < gScore[v]) {
         gScore[v] = tentativeG
+        nodeZ[v] = zV
         parent[v] = u
         openStamp[v] = stamp
         const h = octileH(vx, vy, tx, ty, step)
@@ -335,7 +438,7 @@ export function findPath(nav: NavGrid, from: Vec3, to: Vec3, canJet: boolean): V
     const cy = (cur / nx) | 0
     const wx = nav.minX + (cx + 0.5) * step
     const wy = nav.minY + (cy + 0.5) * step
-    const wz = canJet && cellBlocked[cur] ? cellRoofZ[cur] : cellZ[cur]
+    const wz = nodeZ[cur]
     rev.push([wx, wy, wz])
     cur = parent[cur]
   }
@@ -375,15 +478,17 @@ export function findCover(
   pos: Vec3,
   threats: Vec3[],
   radius: number,
-  canopyBlocks: boolean,
+  isSafe?: (x: number, y: number) => boolean,
+  eyeHeight = 8,
 ): Vec3 | null {
   if (threats.length === 0) return null
 
   const [cx, cy] = worldToGrid(nav, pos[0], pos[1])
   const rCells = Math.max(1, Math.ceil(radius / nav.step))
   const rSq = radius * radius
+  const innerRSq = 16 * 16
 
-  const candidates: Array<{ idx: number; wx: number; wy: number; wz: number; distSq: number }> = []
+  const candidates: Array<{ wx: number; wy: number; wz: number; distSq: number }> = []
   const gx0 = Math.max(0, cx - rCells)
   const gx1 = Math.min(nav.nx - 1, cx + rCells)
   const gy0 = Math.max(0, cy - rCells)
@@ -394,6 +499,7 @@ export function findCover(
     const dy = wy - pos[1]
     const dySq = dy * dy
     const row = gy * nav.nx
+    const oddY = ((gy - cy) & 1) !== 0
     for (let gx = gx0; gx <= gx1; gx++) {
       const idx = row + gx
       if (nav.cellBlocked[idx]) continue
@@ -402,70 +508,49 @@ export function findCover(
       const dx = wx - pos[0]
       const distSq = dx * dx + dySq
       if (distSq > rSq || distSq < 4) continue
-      candidates.push({ idx, wx, wy, wz: nav.cellZ[idx], distSq })
+      if (distSq > innerRSq && (oddY || ((gx - cx) & 1) !== 0)) continue
+      if (isSafe && !isSafe(wx, wy)) continue
+      candidates.push({ wx, wy, wz: nav.cellZ[idx], distSq })
     }
   }
 
   if (candidates.length === 0) return null
   candidates.sort((a, b) => a.distSq - b.distSq)
 
-  const maxToTest = Math.min(candidates.length, 64)
+  const maxToTest = Math.min(candidates.length, 160)
   let bestCandidate: Vec3 | null = null
-  let bestVisible = Infinity
+  let bestExposed = Infinity
+  let bestScore = Infinity
 
   for (let i = 0; i < maxToTest; i++) {
     const c = candidates[i]
-    const candEye: Vec3 = [c.wx, c.wy, c.wz + 6.0]
-    let visibleCount = 0
+    const candEye: Vec3 = [c.wx, c.wy, c.wz + eyeHeight]
+    let exposed = 0
+    let minThreatDistSq = Infinity
 
     for (let t = 0; t < threats.length; t++) {
       const th = threats[t]
-      const threatEye: Vec3 = [th[0], th[1], th[2] + 6.0]
-      if (hasVisionLOS(world, scratch, threatEye, candEye, canopyBlocks)) {
-        visibleCount++
-        if (visibleCount >= bestVisible) break
+      const tdx = c.wx - th[0]
+      const tdy = c.wy - th[1]
+      const tDistSq = tdx * tdx + tdy * tdy
+      if (tDistSq < minThreatDistSq) minThreatDistSq = tDistSq
+
+      const threatEye: Vec3 = [th[0], th[1], th[2] + eyeHeight]
+      if (hasShotLOS(world, scratch, threatEye, candEye)) {
+        exposed++
+        if (exposed > bestExposed) break
       }
     }
 
-    if (visibleCount === 0) {
-      return [c.wx, c.wy, c.wz]
-    }
-    if (visibleCount < bestVisible) {
-      bestVisible = visibleCount
+    if (exposed > bestExposed) continue
+
+    const score = Math.sqrt(c.distSq) - 0.5 * Math.sqrt(minThreatDistSq)
+    if (exposed < bestExposed || score < bestScore) {
+      bestExposed = exposed
+      bestScore = score
       bestCandidate = [c.wx, c.wy, c.wz]
     }
   }
 
   return bestCandidate
-}
-
-/**
- * Local obstacle/slope avoidance helper for smooth movement along a waypoint.
- */
-export function computeLocalSteer(
-  world: WorldData,
-  pos: Vec3,
-  target: Vec3,
-  maxSlopeDeg: number,
-): Vec2 {
-  const dx = target[0] - pos[0]
-  const dy = target[1] - pos[1]
-  const dist = Math.hypot(dx, dy)
-  if (dist < 1e-4) return [0, 0]
-
-  const baseYaw = Math.atan2(dy, dx)
-  const feelerDist = Math.min(4.0, dist)
-  const angles = [0, 0.55, -0.55, 1.05, -1.05]
-
-  for (let i = 0; i < angles.length; i++) {
-    const yaw = baseYaw + angles[i]
-    const fx = pos[0] + Math.cos(yaw) * feelerDist
-    const fy = pos[1] + Math.sin(yaw) * feelerDist
-    const sz = surfaceZAt(world, fx, fy, pos[2])
-    if (sz - pos[2] <= 1.4 && slopeAt(world, fx, fy) <= maxSlopeDeg) {
-      return [Math.cos(yaw), Math.sin(yaw)]
-    }
-  }
-
-  return [dx / dist, dy / dist]
 }

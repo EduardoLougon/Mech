@@ -1,18 +1,18 @@
 import type { Config, Observation, UpgradeDef, WeaponKind } from "../mechfight.ts"
 
 const BASE_UPGRADE_SCORES: Record<string, number> = {
-  armor: 100,
-  sensors: 92,
-  hp: 86,
-  speed: 82,
+  armor: 110,
+  sensors: 98,
+  hp: 94,
+  speed: 90,
   energy: 76,
 }
 
 const WEAPON_TIER_BONUS: Record<WeaponKind, number> = {
-  laser: 18,
-  mortar: 16,
-  lightning: 16,
-  gun: 12,
+  laser: 10,
+  mortar: 8,
+  lightning: 8,
+  gun: 4,
 }
 
 /**
@@ -41,7 +41,7 @@ function scoreChoice(
     if (def.requires) {
       if (heldWeapons.has(def.requires)) {
         // Weapon-specific upgrade for a weapon we actually hold
-        score = 84 + WEAPON_TIER_BONUS[def.requires]
+        score = 78 + WEAPON_TIER_BONUS[def.requires]
       } else {
         // We don't hold the required weapon right now
         score = 20
@@ -59,15 +59,15 @@ function scoreChoice(
   } else {
     // Fallback heuristic on id/name/desc if not in config.upgrades
     const text = `${choiceId} ${choiceName} ${choiceDesc}`.toLowerCase()
-    if (text.includes("armor") || text.includes("damage taken")) score = 100
-    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 92
-    else if (text.includes("hp") || text.includes("health")) score = 86
-    else if (text.includes("speed") || text.includes("move")) score = 82
+    if (text.includes("armor") || text.includes("damage taken")) score = 110
+    else if (text.includes("sensor") || text.includes("vision") || text.includes("proximity")) score = 98
+    else if (text.includes("hp") || text.includes("health")) score = 94
+    else if (text.includes("speed") || text.includes("move")) score = 90
     else if (text.includes("energy")) score = 76
     else {
       for (const w of heldWeapons) {
         if (text.includes(w)) {
-          score = 84 + WEAPON_TIER_BONUS[w]
+          score = 78 + WEAPON_TIER_BONUS[w]
           break
         }
       }

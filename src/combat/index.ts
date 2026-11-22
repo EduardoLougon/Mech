@@ -16,7 +16,10 @@ export function createCombat(config: Config): CombatController {
   return {
     act(obs, world, threats, order): Partial<BotAction> {
       const weaponAct = chooseWeaponAction(obs, config, world, threats, order)
-      const lootAct = chooseLootAction(obs, config, order)
+      const lootAct = chooseLootAction(obs, config, threats, order)
+      if (lootAct.drop !== undefined && weaponAct.fire) {
+        weaponAct.fire[lootAct.drop] = false
+      }
       return {
         ...weaponAct,
         ...lootAct,

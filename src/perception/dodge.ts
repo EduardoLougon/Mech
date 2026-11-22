@@ -12,10 +12,13 @@ export interface DodgeResult {
 }
 
 const HORIZON_S = 0.6
-const MORTAR_STEPS = 20
+const MORTAR_HORIZON_S = 2.5
+const MORTAR_STEPS = 50
 const MECH_CENTER_Z = 4.5
+const MECH_HIGH_Z = 8.0
+const ENEMY_MUZZLE_Z = 7.0
 const PROJ_DANGER_RADIUS = 3.5
-const MORTAR_DANGER_RADIUS = 5.5
+const MORTAR_DANGER_RADIUS = 9.5
 const LASER_RAY_RADIUS = 6.0
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -59,8 +62,9 @@ function pickPerpendicular(dir2d: Vec2, away2d: Vec2, selfVel2d: Vec2): Vec2 {
 }
 
 /**
- * Compute a perpendicular 2D dodge vector and urgency [0, 1] from incoming
- * projectiles (linear gun/npc, parabolic mortar) and charging enemy lasers.
+ * Compute a 2D dodge vector and urgency [0, 1] from incoming projectiles
+ * (linear gun/npc with LOS check, parabolic mortar up to 2.5s against
+ * surfaceZAt) and charging enemy lasers.
  */
 export function computeDodge(
   obs: Observation,
@@ -72,6 +76,11 @@ export function computeDodge(
     obs.self.pos[1],
     obs.self.pos[2] + MECH_CENTER_Z,
   ]
+  const selfHigh: Vec3 = [
+    obs.self.pos[0],
+    obs.self.pos[1],
+    obs.self.pos[2] + MECH_HIGH_Z,
+  ]
   const selfVel2d: Vec2 = [obs.self.vel[0], obs.self.vel[1]]
   const gravity = config.weapons.mortar.gravity ?? 22
 
@@ -80,12 +89,13 @@ export function computeDodge(
   let maxUrgency = 0
 
   for (const proj of obs.projectiles) {
-    let minDist = Infinity
-    let bestT = 0
-    let closestPt: Vec3 = [proj.pos[0], proj.pos[1], proj.pos[2]]
-
     if (proj.kind === "mortar") {
-      const dtStep = HORIZON_S / MORTAR_STEPS
+      const dtStep = MORTAR_HORIZON_S / MORTAR_STEPS
+      let minDist = Infinity
+      let bestT = 0
+      let threatPt: Vec3 = [proj.pos[0], proj.pos[1], proj.pos[2]]
+      let impacted = false
+
       for (let i = 1; i <= MORTAR_STEPS; i++) {
         const t = i * dtStep
         const pt: Vec3 = [
@@ -93,37 +103,84 @@ export function computeDodge(
           proj.pos[1] + proj.vel[1] * t,
           proj.pos[2] + proj.vel[2] * t - 0.5 * gravity * t * t,
         ]
+        const surfZ = world.surfaceZAt(pt[0], pt[1], pt[2])
+        if (pt[2] <= surfZ) {
+          const impactPt: Vec3 = [pt[0], pt[1], surfZ]
+          const dImpact = dist3(impactPt, selfCenter)
+          if (dImpact < minDist) {
+            minDist = dImpact
+            bestT = t
+            threatPt = impactPt
+          }
+          impacted = true
+          break
+        }
         const d = dist3(pt, selfCenter)
         if (d < minDist) {
           minDist = d
           bestT = t
-          closestPt = pt
+          threatPt = pt
         }
       }
-    } else {
-      const rel: Vec3 = [
-        proj.pos[0] - selfCenter[0],
-        proj.pos[1] - selfCenter[1],
-        proj.pos[2] - selfCenter[2],
-      ]
-      const vSq = dot3(proj.vel, proj.vel)
-      if (vSq < 1e-6) continue
-      const tStar = clamp(-dot3(rel, proj.vel) / vSq, 0, HORIZON_S)
-      if (tStar <= 0) continue
-      closestPt = [
-        proj.pos[0] + proj.vel[0] * tStar,
-        proj.pos[1] + proj.vel[1] * tStar,
-        proj.pos[2] + proj.vel[2] * tStar,
-      ]
-      minDist = dist3(closestPt, selfCenter)
-      bestT = tStar
+
+      if (minDist <= MORTAR_DANGER_RADIUS && bestT > 0) {
+        // Skip if a wall/terrain blocks the mortar blast from us after impact
+        if (
+          impacted &&
+          !world.hasShotLOS(
+            [threatPt[0], threatPt[1], threatPt[2] + 0.5],
+            selfCenter,
+          )
+        ) {
+          continue
+        }
+        const distFactor = 1 - clamp(minDist / MORTAR_DANGER_RADIUS, 0, 1)
+        const timeFactor = 1 - clamp(bestT / MORTAR_HORIZON_S, 0, 1) * 0.45
+        const urgency = clamp(0.45 + 0.55 * distFactor * timeFactor, 0, 1)
+
+        // Steer directly away from predicted mortar impact
+        const awayX = selfCenter[0] - threatPt[0]
+        const awayY = selfCenter[1] - threatPt[1]
+        const awayLen = Math.hypot(awayX, awayY)
+        const dir: Vec2 =
+          awayLen > 1e-3
+            ? [awayX / awayLen, awayY / awayLen]
+            : pickPerpendicular(
+                [proj.vel[0], proj.vel[1]],
+                [awayX, awayY],
+                selfVel2d,
+              )
+        sumX += dir[0] * urgency
+        sumY += dir[1] * urgency
+        if (urgency > maxUrgency) maxUrgency = urgency
+      }
+      continue
     }
 
-    const dangerRadius =
-      proj.kind === "mortar" ? MORTAR_DANGER_RADIUS : PROJ_DANGER_RADIUS
-    if (minDist <= dangerRadius && bestT > 0) {
-      const distFactor = 1 - clamp(minDist / dangerRadius, 0, 1)
-      const timeFactor = 1 - clamp(bestT / HORIZON_S, 0, 1) * 0.4
+    // Linear projectiles (gun, npc)
+    const rel: Vec3 = [
+      proj.pos[0] - selfCenter[0],
+      proj.pos[1] - selfCenter[1],
+      proj.pos[2] - selfCenter[2],
+    ]
+    const vSq = dot3(proj.vel, proj.vel)
+    if (vSq < 1e-6) continue
+    const tStar = clamp(-dot3(rel, proj.vel) / vSq, 0, HORIZON_S)
+    if (tStar <= 0) continue
+
+    const closestPt: Vec3 = [
+      proj.pos[0] + proj.vel[0] * tStar,
+      proj.pos[1] + proj.vel[1] * tStar,
+      proj.pos[2] + proj.vel[2] * tStar,
+    ]
+    const minDist = dist3(closestPt, selfCenter)
+    if (minDist <= PROJ_DANGER_RADIUS) {
+      // Skip shots blocked by terrain/prisms before reaching us
+      if (!world.hasShotLOS(proj.pos, closestPt)) {
+        continue
+      }
+      const distFactor = 1 - clamp(minDist / PROJ_DANGER_RADIUS, 0, 1)
+      const timeFactor = 1 - clamp(tStar / HORIZON_S, 0, 1) * 0.4
       const urgency = clamp(0.45 + 0.55 * distFactor * timeFactor, 0, 1)
 
       const away2d: Vec2 = [
@@ -143,31 +200,48 @@ export function computeDodge(
 
   for (const m of obs.mechs) {
     if (!m.charging) continue
-    const origin: Vec3 = [m.pos[0], m.pos[1], m.pos[2] + MECH_CENTER_Z]
+    const origin: Vec3 = [m.pos[0], m.pos[1], m.pos[2] + ENEMY_MUZZLE_Z]
     const yaw = m.aim[0]
     const pitch = m.aim[1]
     const cp = Math.cos(pitch)
     const dir: Vec3 = [cp * Math.cos(yaw), cp * Math.sin(yaw), Math.sin(pitch)]
 
-    const rel: Vec3 = [
-      selfCenter[0] - origin[0],
-      selfCenter[1] - origin[1],
-      selfCenter[2] - origin[2],
-    ]
-    const projLen = dot3(rel, dir)
-    if (projLen <= 0) continue
+    let bestDist = Infinity
+    let bestClosestPt: Vec3 | null = null
+    let bestTarget: Vec3 | null = null
 
-    const closestPt: Vec3 = [
-      origin[0] + dir[0] * projLen,
-      origin[1] + dir[1] * projLen,
-      origin[2] + dir[2] * projLen,
-    ]
-    const d = dist3(selfCenter, closestPt)
-    if (d <= LASER_RAY_RADIUS && world.hasShotLOS(origin, selfCenter)) {
-      const urgency = clamp(0.65 + 0.35 * (1 - d / LASER_RAY_RADIUS), 0, 1)
+    for (const target of [selfCenter, selfHigh]) {
+      const rel: Vec3 = [
+        target[0] - origin[0],
+        target[1] - origin[1],
+        target[2] - origin[2],
+      ]
+      const projLen = dot3(rel, dir)
+      if (projLen <= 0) continue
+
+      const closestPt: Vec3 = [
+        origin[0] + dir[0] * projLen,
+        origin[1] + dir[1] * projLen,
+        origin[2] + dir[2] * projLen,
+      ]
+      const d = dist3(target, closestPt)
+      if (d < bestDist) {
+        bestDist = d
+        bestClosestPt = closestPt
+        bestTarget = target
+      }
+    }
+
+    if (
+      bestClosestPt !== null &&
+      bestTarget !== null &&
+      bestDist <= LASER_RAY_RADIUS &&
+      world.hasShotLOS(origin, bestTarget)
+    ) {
+      const urgency = clamp(0.65 + 0.35 * (1 - bestDist / LASER_RAY_RADIUS), 0, 1)
       const away2d: Vec2 = [
-        selfCenter[0] - closestPt[0],
-        selfCenter[1] - closestPt[1],
+        bestTarget[0] - bestClosestPt[0],
+        bestTarget[1] - bestClosestPt[1],
       ]
       const perp = pickPerpendicular([dir[0], dir[1]], away2d, selfVel2d)
       sumX += perp[0] * urgency

@@ -12,7 +12,7 @@ import type {
 import { pickUpgrade } from "./upgrades.ts"
 import { clampToSafeZone, evaluateZone, isPointInSafeZone } from "./zone.ts"
 
-const PRACTICE_LOADOUT: WeaponKind[] = ["mortar", "lightning", "laser", "gun"]
+const PRACTICE_LOADOUT: WeaponKind[] = ["laser", "lightning", "gun", "mortar"]
 const FFA_LOADOUT: WeaponKind[] = ["laser", "lightning", "mortar", "gun"]
 
 const COMBAT_SOUND_KINDS = new Set([
@@ -158,8 +158,14 @@ function findRetreatTarget(
 ): Vec3 {
   const enemyPositions = threats.enemies.map((e) => e.pos)
   if (enemyPositions.length > 0) {
-    const cover = world.findCover(obs.self.pos, enemyPositions, 36)
-    if (cover && isPointInSafeZone(cover, obs, 5)) {
+    const cover = world.findCover(
+      obs.self.pos,
+      enemyPositions,
+      36,
+      (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
+      obs.self.stats.eye_height ?? 8,
+    )
+    if (cover) {
       return cover
     }
   }
@@ -229,6 +235,8 @@ export interface Strategy {
  * Create the dual-mode macro strategy engine (1v15 Practice + 16-mech FFA).
  */
 export function createStrategy(config: Config): Strategy {
+  let inRegenHide = false
+
   return {
     decide(obs: Observation, world: WorldQuery, threats: ThreatState) {
       const pick = pickUpgrade(obs, config)
@@ -236,9 +244,14 @@ export function createStrategy(config: Config): Strategy {
       const desiredLoadout = isPractice ? PRACTICE_LOADOUT : FFA_LOADOUT
       const held = getHeldWeaponKinds(obs)
       const zoneAdvice = evaluateZone(obs, world, config)
+      const practicePreferSilent =
+        threats.spottedByCount === 0 && !hasEnemyWithin(threats.enemies, obs.self.pos, 50)
 
       // 1. Zone Override: avoid zone damage (ignores armor and resets 5s HP regen)
       if (zoneAdvice.mustSprint) {
+        if (!obs.self.in_zone) {
+          inRegenHide = false
+        }
         const nearestMech = pickBestMechTarget(obs, threats, isPractice)
         return {
           pick,
@@ -253,12 +266,20 @@ export function createStrategy(config: Config): Strategy {
         }
       }
 
-      // 2. Emergency Regen: break LoS for 5s to trigger 45 HP/s regeneration
+      // 2. Emergency Regen (with hysteresis): enter < 0.65 (Practice) or < 0.50 (FFA), stay until >= 0.92
       const hpRatio = obs.self.hp / Math.max(1, obs.self.max_hp)
       const regenThreshold = isPractice ? 0.65 : 0.50
-      if (hpRatio < regenThreshold && obs.self.in_zone) {
+      if (!obs.self.in_zone || hpRatio >= 0.92) {
+        inRegenHide = false
+      } else if (hpRatio < regenThreshold) {
+        inRegenHide = true
+      }
+
+      if (inRegenHide && obs.self.in_zone) {
         const retreatTarget = findRetreatTarget(obs, threats, world)
-        const silentRegen = isPractice || hasEnemyWithin(threats.enemies, obs.self.pos, 45)
+        const silentRegen = isPractice
+          ? practicePreferSilent
+          : threats.spottedByCount === 0 && hasEnemyWithin(threats.enemies, obs.self.pos, 45)
         return {
           pick,
           order: {
@@ -274,27 +295,28 @@ export function createStrategy(config: Config): Strategy {
 
       // 3. 1v15 Practice Mode
       if (isPractice) {
-        const preferSilent = hasEnemyWithin(threats.enemies, obs.self.pos, 45)
+        const preferSilent = practicePreferSilent
 
-        // Only farm isolated crates/NPCs/pickups when unspotted and < 8 cubes
-        if (threats.spottedByCount === 0 && obs.self.cubes < 8) {
-          // Loose cubes nearby
-          for (const c of obs.cubes) {
-            if (
-              dist2D(obs.self.pos, c.pos) <= 40 &&
-              isPointInSafeZone(c.pos, obs, 6) &&
-              !hasEnemyWithin(threats.enemies, c.pos, 50)
-            ) {
-              return {
-                pick,
-                order: {
-                  mode: "farm_crate",
-                  moveTarget: c.pos,
-                  primaryTargetId: null,
-                  desiredLoadout,
-                  preferSilent,
-                  holdFireForRegen: false,
-                },
+        // Only collect loose cubes and ground pickups when unspotted (never shoot crates or NPCs in Practice)
+        if (threats.spottedByCount === 0) {
+          if (obs.self.cubes < 8) {
+            for (const c of obs.cubes) {
+              if (
+                dist2D(obs.self.pos, c.pos) <= 40 &&
+                isPointInSafeZone(c.pos, obs, 6) &&
+                !hasEnemyWithin(threats.enemies, c.pos, 50)
+              ) {
+                return {
+                  pick,
+                  order: {
+                    mode: "farm_crate",
+                    moveTarget: c.pos,
+                    primaryTargetId: null,
+                    desiredLoadout,
+                    preferSilent,
+                    holdFireForRegen: false,
+                  },
+                }
               }
             }
           }
@@ -314,63 +336,6 @@ export function createStrategy(config: Config): Strategy {
               },
             }
           }
-
-          // Isolated crate
-          let bestCratePos: Vec3 | null = null
-          let bestCrateDist = 60
-          for (const crate of obs.crates) {
-            const d = dist2D(obs.self.pos, crate.pos)
-            if (
-              d < bestCrateDist &&
-              isPointInSafeZone(crate.pos, obs, 6) &&
-              !hasEnemyWithin(threats.enemies, crate.pos, 55)
-            ) {
-              bestCrateDist = d
-              bestCratePos = crate.pos
-            }
-          }
-          if (bestCratePos) {
-            return {
-              pick,
-              order: {
-                mode: "farm_crate",
-                moveTarget: bestCratePos,
-                primaryTargetId: null,
-                desiredLoadout,
-                preferSilent,
-                holdFireForRegen: false,
-              },
-            }
-          }
-
-          // Isolated NPC drone
-          let bestNpc: TrackedEnemy | null = null
-          let bestNpcDist = 65
-          for (const e of threats.enemies) {
-            if (e.kind !== "npc") continue
-            const d = dist2D(obs.self.pos, e.pos)
-            if (
-              d < bestNpcDist &&
-              isPointInSafeZone(e.pos, obs, 6) &&
-              !hasEnemyWithin(threats.enemies, e.pos, 60)
-            ) {
-              bestNpcDist = d
-              bestNpc = e
-            }
-          }
-          if (bestNpc) {
-            return {
-              pick,
-              order: {
-                mode: "farm_npc",
-                moveTarget: getStandoffPoint(obs.self.pos, bestNpc.pos, 26, obs, world),
-                primaryTargetId: bestNpc.id,
-                desiredLoadout,
-                preferSilent,
-                holdFireForRegen: false,
-              },
-            }
-          }
         }
 
         // Ghost kite: stay behind cover, lob mortar over walls, splash contested drops
@@ -381,8 +346,14 @@ export function createStrategy(config: Config): Strategy {
 
         let moveTarget: Vec3 | null = null
         if (mechPositions.length > 0) {
-          const cover = world.findCover(obs.self.pos, mechPositions, 36)
-          if (cover && isPointInSafeZone(cover, obs, 5)) {
+          const cover = world.findCover(
+            obs.self.pos,
+            mechPositions,
+            36,
+            (cx, cy) => isPointInSafeZone([cx, cy], obs, 4),
+            obs.self.stats.eye_height ?? 8,
+          )
+          if (cover) {
             moveTarget = cover
           } else if (target) {
             const kiteRange = held.has("mortar") ? 65 : 42

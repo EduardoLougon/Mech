@@ -715,7 +715,7 @@ class ExternalBotClient {
 // Built-in House Bot AI (baseline opponent for 1v15)
 // ---------------------------------------------------------------------------
 
-function houseBotAct(obs: Observation, rng: Rng): Action {
+function houseBotAct(obs: Observation, rng: Rng, isSquad1v15 = false): Action {
   const me = obs.self
   const act: Action = { tick: obs.tick }
 
@@ -743,9 +743,18 @@ function houseBotAct(obs: Observation, rng: Rng): Action {
     }
   }
 
-  // Engage nearest visible enemy mech or NPC
-  const enemies = obs.mechs.filter((m) => m.kind === "mech")
-  const target = enemies[0] ?? obs.mechs[0] ?? null
+  // In 1v15 squad mode, house bots ONLY target slot 0 (player), never each other.
+  // In FFA mode, target nearest visible enemy mech (or NPC).
+  const enemies = isSquad1v15
+    ? obs.mechs.filter((m) => m.kind === "mech" && m.id === 0)
+    : obs.mechs.filter((m) => m.kind === "mech")
+  let target = enemies[0] ?? (isSquad1v15 ? null : obs.mechs[0] ?? null)
+  if (!isSquad1v15 && enemies.length > 1) {
+    target = enemies.reduce((best, cur) =>
+      dist3(me.pos, cur.pos) < dist3(me.pos, best.pos) ? cur : best
+    )
+  }
+
   if (target) {
     const dx = target.pos[0] - me.pos[0]
     const dy = target.pos[1] - me.pos[1]
@@ -755,36 +764,43 @@ function houseBotAct(obs: Observation, rng: Rng): Action {
     const pitch = Math.atan2(dz, horiz)
     act.aim = [yaw, pitch]
 
+    // Early game in 1v15: 1-3 bots converge aggressively, others converge later or when close
+    const squadConverge = !isSquad1v15 || obs.t >= 40 || obs.zone.radius < 380 || me.id <= 3 || horiz < 130
+
     const fire: [boolean, boolean] = [false, false]
-    for (let s = 0; s < 2; s++) {
-      const w = me.weapons[s]
-      if (!w) continue
-      if (w.kind === "gun" && (w.ammo ?? 0) > 0 && w.cooldown <= 0 && horiz < 210) fire[s] = true
-      if (w.kind === "lightning" && horiz < 42 && me.energy > 15 && w.cooldown <= 0) fire[s] = true
-      if (w.kind === "laser" && horiz < 250 && w.cooldown <= 0) {
-        fire[s] = (w.charge ?? 0) < 0.7
+    if (horiz < 250) {
+      for (let s = 0; s < 2; s++) {
+        const w = me.weapons[s]
+        if (!w) continue
+        if (w.kind === "gun" && (w.ammo ?? 0) > 0 && w.cooldown <= 0 && horiz < 210) fire[s] = true
+        if (w.kind === "lightning" && horiz < 42 && me.energy > 15 && w.cooldown <= 0) fire[s] = true
+        if (w.kind === "laser" && horiz < 250 && w.cooldown <= 0) {
+          fire[s] = (w.charge ?? 0) < 0.7
+        }
+        if (w.kind === "mortar" && horiz > 20 && horiz < 210 && w.cooldown <= 0) fire[s] = true
       }
-      if (w.kind === "mortar" && horiz > 20 && horiz < 210 && w.cooldown <= 0) fire[s] = true
     }
     act.fire = fire
 
-    if (!act.move) {
+    if (!act.move && squadConverge) {
       const strafe = (obs.tick % 40) < 20 ? 1 : -1
       const desiredDist = 45
-      const radial = horiz > desiredDist ? 0.7 : -0.5
+      const radial = horiz > desiredDist ? 0.75 : -0.45
       const nx = dx / horiz, ny = dy / horiz
-      const mx = nx * radial - ny * 0.7 * strafe
-      const my = ny * radial + nx * 0.7 * strafe
+      const mx = nx * radial - ny * 0.65 * strafe
+      const my = ny * radial + nx * 0.65 * strafe
       const mlen = Math.hypot(mx, my) || 1
       act.move = [mx / mlen, my / mlen]
       act.boost = !me.in_zone || horiz > 120
     }
-  } else {
+  }
+
+  if (!act.move) {
     // Move toward zone center with mild wander
     const zx = obs.zone.next_center[0] - me.pos[0]
     const zy = obs.zone.next_center[1] - me.pos[1]
     const zdist = Math.hypot(zx, zy)
-    if (!me.in_zone || zdist > obs.zone.radius * 0.65) {
+    if (!me.in_zone || zdist > obs.zone.radius * 0.6) {
       const len = zdist || 1
       act.move = [zx / len, zy / len]
       act.boost = !me.in_zone
@@ -792,7 +808,9 @@ function houseBotAct(obs: Observation, rng: Rng): Action {
       const ang = ((obs.tick * 0.05 + me.id * 1.7) % (Math.PI * 2))
       act.move = [Math.cos(ang) * 0.6, Math.sin(ang) * 0.6]
     }
-    act.aim = [wrapAngle(me.aim[0] + (rng.next() - 0.5) * 0.4), 0]
+    if (!act.aim) {
+      act.aim = [wrapAngle(me.aim[0] + (rng.next() - 0.5) * 0.4), 0]
+    }
   }
 
   return act
@@ -919,6 +937,8 @@ export class ArenaMatch {
   private readonly world: SimWorld
   private readonly cfg: Config
   private readonly rng: Rng
+  private readonly mode: "1v15" | "ffa"
+  private squadKnownUntilT = -1
   private mechs: MechState[] = []
   private projectiles: SimProjectile[] = []
   private npcs: SimNpc[] = []
@@ -938,10 +958,11 @@ export class ArenaMatch {
   private nextZoneRadius: number
   private targetLatenciesMs: number[] = []
 
-  constructor(world: SimWorld, seed: number, cfg: Config = DEFAULT_CONFIG) {
+  constructor(world: SimWorld, seed: number, cfg: Config = DEFAULT_CONFIG, mode: "1v15" | "ffa" = "1v15") {
     this.world = world
     this.cfg = cfg
     this.rng = new Rng(seed)
+    this.mode = mode
     this.zoneCenter = [...cfg.zone.start_center] as Vec2
     this.zoneRadius = cfg.zone.start_radius
     this.nextZoneCenter = this.pickNextZoneCenter(this.zoneCenter, this.zoneRadius, cfg.zone.phases[0].radius)
@@ -1127,6 +1148,9 @@ export class ArenaMatch {
       const dx = origin[0] - m.pos[0], dy = origin[1] - m.pos[1]
       const d = Math.hypot(dx, dy)
       if (d > maxR) continue
+      if (this.mode === "1v15" && excludeId === 0 && m.id > 0) {
+        this.squadKnownUntilT = Math.max(this.squadKnownUntilT, this.t + (this.cfg.vision.memory_s ?? 5))
+      }
       const noiseRad = ((this.cfg.sound.bearing_noise_deg * (m.stats.hearing ?? 1)) * Math.PI) / 180
       const bearing = wrapAngle(Math.atan2(dy, dx) + this.rng.gaussian() * noiseRad)
       const dist: SoundObs["dist"] = d < this.cfg.sound.near ? "near" : d < this.cfg.sound.mid ? "mid" : "far"
@@ -1138,12 +1162,17 @@ export class ArenaMatch {
     const mechsObs: ActorObs[] = []
     for (const other of this.mechs) {
       if (!other.alive || other.id === m.id) continue
+      if (this.mode === "1v15" && m.id > 0 && other.id > 0) continue
       const vis = this.isVisible(m, other.pos, other.stats.height)
       if (vis) {
         m.memory.set(other.id, this.t + (this.cfg.vision.memory_s ?? 5))
+        if (this.mode === "1v15" && m.id > 0 && other.id === 0) {
+          this.squadKnownUntilT = Math.max(this.squadKnownUntilT, this.t + (this.cfg.vision.memory_s ?? 5))
+        }
       }
+      const squadShared = this.mode === "1v15" && m.id > 0 && other.id === 0 && this.squadKnownUntilT >= this.t
       const memExp = m.memory.get(other.id) ?? -1
-      if (vis || memExp >= this.t) {
+      if (vis || memExp >= this.t || squadShared) {
         mechsObs.push({
           id: other.id,
           kind: "mech",
@@ -1265,6 +1294,7 @@ export class ArenaMatch {
 
   private damageMech(target: MechState, rawAmount: number, weapon: string, sourcePos: Vec3 | null, attackerId: number | null): void {
     if (!target.alive) return
+    if (this.mode === "1v15" && attackerId !== null && attackerId > 0 && target.id > 0) return
     let amount = rawAmount
     let rear = false
     let bearing: number | null = null
@@ -1767,6 +1797,7 @@ export class ArenaMatch {
     let hitTarget: MechState | null = null
     for (const other of this.mechs) {
       if (!other.alive || other.id === m.id) continue
+      if (this.mode === "1v15" && m.id > 0 && other.id > 0) continue
       const ox = other.pos[0] - muzzle[0], oy = other.pos[1] - muzzle[1], oz = other.pos[2] + 4.5 - muzzle[2]
       const proj = ox * d[0] + oy * d[1] + oz * d[2]
       if (proj < 0 || proj > bestT) continue
@@ -1801,6 +1832,7 @@ export class ArenaMatch {
     let bestD = w.stats.range
     for (const other of this.mechs) {
       if (!other.alive || other.id === m.id) continue
+      if (this.mode === "1v15" && m.id > 0 && other.id > 0) continue
       const d = dist3(muzzle, other.pos)
       if (d > bestD) continue
       const yaw = Math.atan2(other.pos[1] - muzzle[1], other.pos[0] - muzzle[0])
@@ -1958,7 +1990,7 @@ export class ArenaMatch {
     const dt = 1 / this.cfg.match.tick_hz
     const decideEvery = this.cfg.match.decide_every
 
-    while (this.aliveCount > 1 && this.tick < maxTicks) {
+    while (this.aliveCount > 1 && this.tick < maxTicks && (this.mode !== "1v15" || this.mechs[0].alive)) {
       if (this.tick % decideEvery === 0) {
         const aliveMechs = this.mechs.filter((m) => m.alive)
         await Promise.all(
@@ -1978,7 +2010,7 @@ export class ArenaMatch {
                 }
               }
             } else {
-              const act = houseBotAct(obs, this.rng)
+              const act = houseBotAct(obs, this.rng, this.mode === "1v15" && m.id > 0)
               m.lastAction = act
               this.applyOneShotAction(m, act)
             }
@@ -2044,7 +2076,7 @@ export async function runBenchmark(opts: BenchmarkOptions): Promise<void> {
 
   for (let mIdx = 0; mIdx < opts.matches; mIdx++) {
     const matchSeed = opts.seed + mIdx * 997
-    const match = new ArenaMatch(world, matchSeed, cfg)
+    const match = new ArenaMatch(world, matchSeed, cfg, opts.mode)
     const clients: Array<ExternalBotClient | null> = []
     const targetSlots = new Set<number>()
 

@@ -82,10 +82,13 @@ export function solveGunIntercept(
     t = dist / speed
   }
 
+  const vzLead = Math.abs(vz) > 2.0 ? vz * t - 0.5 * 22 * t * t : vz * t
+  const rawZ = targetPos[2] + vzLead
+  const groundZ = world.heightAt(targetPos[0] + vx * t, targetPos[1] + vy * t)
   const intercept: Vec3 = [
     targetPos[0] + vx * t,
     targetPos[1] + vy * t,
-    targetPos[2] + vz * t,
+    Math.max(groundZ + 1.0, rawZ),
   ]
 
   const shotDist = Math.hypot(
@@ -237,17 +240,26 @@ export function solveMortarArc(
 
 /**
  * Rear-armor yaw protection when idle or holding fire for regen.
+ * Oscillates +-0.9 rad around moveYaw when no primaryThreatBearing so the 120° FOV sweeps ~220°.
  */
 export function idleAim(obs: Observation, threats: ThreatState, order: MacroOrder): Vec2 {
   if (threats.primaryThreatBearing !== null) {
     return [threats.primaryThreatBearing, -0.04]
   }
+  let moveYaw = obs.self.aim[0]
   if (order.moveTarget) {
     const dx = order.moveTarget[0] - obs.self.pos[0]
     const dy = order.moveTarget[1] - obs.self.pos[1]
     if (Math.hypot(dx, dy) > 1) {
-      return [Math.atan2(dy, dx), -0.04]
+      moveYaw = Math.atan2(dy, dx)
+    }
+  } else {
+    const dx = obs.zone.next_center[0] - obs.self.pos[0]
+    const dy = obs.zone.next_center[1] - obs.self.pos[1]
+    if (Math.hypot(dx, dy) > 1) {
+      moveYaw = Math.atan2(dy, dx)
     }
   }
-  return [obs.self.aim[0], 0]
+  const sweep = 0.9 * Math.sin(obs.t * 2.2)
+  return [normalizeAngle(moveYaw + sweep), -0.04]
 }

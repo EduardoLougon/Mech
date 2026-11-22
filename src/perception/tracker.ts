@@ -95,12 +95,12 @@ export function createTracker(config: Config) {
   let nextGhostId = -1
   let prevAlive: number | null = null
   let prevT: number | null = null
-  let ffaConfidence = 0.5
+  let ffaConfidence = 0.35
   let recentDamaged: RecentDamage | null = null
 
   const memoryS = config.vision.memory_s ?? 5
   const visionRange = config.vision.range ?? 200
-  const nearRange = config.vision.near_range ?? 25
+  const nearRange = config.vision.near_range ?? 45
 
   function updateVisibleActors(obs: Observation): Set<number> {
     const visibleIds = new Set<number>()
@@ -326,30 +326,47 @@ export function createTracker(config: Config) {
     spottedByCount: number,
     tickDt: number,
   ): void {
+    const dt = clamp(tickDt, 0.05, 0.5)
+
     // 1. Alive count dropped without our kill
     if (prevAlive !== null && obs.alive < prevAlive) {
       const otherDeaths = Math.max(0, prevAlive - obs.alive - killsThisTick)
       if (otherDeaths > 0) {
-        ffaConfidence = clamp(ffaConfidence + 0.12 * otherDeaths, 0, 1)
+        ffaConfidence = clamp(ffaConfidence + 0.25 * otherDeaths, 0, 1)
       }
     }
 
-    // 2. Far/mid combat sounds while we are unspotted and not recently damaged
+    // 2. >= 2 distinct distant combat bearings (> 35 deg apart) while unspotted
     const recentlyHit =
       recentDamaged !== null && obs.t - recentDamaged.t <= 1.5
     if (spottedByCount === 0 && !recentlyHit) {
-      const distantCombat = obs.sounds.some(
-        (s) =>
-          (s.dist === "far" || s.dist === "mid") &&
-          COMBAT_SOUND_KINDS.has(s.kind),
-      )
-      if (distantCombat) {
-        ffaConfidence = clamp(ffaConfidence + 0.03 * clamp(tickDt, 0.05, 0.5), 0, 1)
+      const distantBearings = obs.sounds
+        .filter(
+          (s) =>
+            (s.dist === "far" || s.dist === "mid") &&
+            COMBAT_SOUND_KINDS.has(s.kind),
+        )
+        .map((s) => s.bearing)
+      const minSep = (35 * Math.PI) / 180
+      let hasDistinctPair = false
+      for (let i = 0; i < distantBearings.length && !hasDistinctPair; i++) {
+        for (let j = i + 1; j < distantBearings.length; j++) {
+          if (angleDiff(distantBearings[i], distantBearings[j]) > minSep) {
+            hasDistinctPair = true
+            break
+          }
+        }
+      }
+      if (hasDistinctPair) {
+        ffaConfidence = clamp(ffaConfidence + 0.15 * dt, 0, 1)
       }
     }
 
     // 3. Visible mechs fighting each other vs converging on us
     const visibleMechs: ActorObs[] = obs.mechs.filter((m) => m.kind === "mech")
+    const beamShooters = new Set(
+      obs.beams.filter((b) => b.by !== obs.self.id).map((b) => b.by),
+    )
     let fightingEachOther = false
     let convergingOnUsCount = 0
     const aimTol = (28 * Math.PI) / 180
@@ -357,13 +374,17 @@ export function createTracker(config: Config) {
     for (const a of visibleMechs) {
       const toUs = bearing2d(a.pos, obs.self.pos)
       const aimingAtUs = angleDiff(a.aim[0], toUs) <= aimTol
+      const hasCombatEvidence = Boolean(a.charging) || beamShooters.has(a.id)
       let aimingAtOther = false
-      for (const b of visibleMechs) {
-        if (a.id === b.id) continue
-        const toB = bearing2d(a.pos, b.pos)
-        if (angleDiff(a.aim[0], toB) <= aimTol && !aimingAtUs) {
-          aimingAtOther = true
-          break
+      if (hasCombatEvidence && !aimingAtUs) {
+        for (const b of visibleMechs) {
+          if (a.id === b.id) continue
+          if (dist3(a.pos, b.pos) > 120) continue
+          const toB = bearing2d(a.pos, b.pos)
+          if (angleDiff(a.aim[0], toB) <= aimTol) {
+            aimingAtOther = true
+            break
+          }
         }
       }
       if (aimingAtOther) fightingEachOther = true
@@ -385,22 +406,14 @@ export function createTracker(config: Config) {
     }
 
     if (fightingEachOther) {
-      ffaConfidence = clamp(ffaConfidence + 0.05, 0, 1)
+      ffaConfidence = clamp(ffaConfidence + 0.35 * dt, 0, 1)
     } else if (convergingOnUsCount >= 2) {
-      ffaConfidence = clamp(
-        ffaConfidence - 0.05 * clamp(tickDt, 0.05, 0.5),
-        0,
-        1,
-      )
+      ffaConfidence = clamp(ffaConfidence - 0.12 * dt, 0, 1)
     }
 
-    // 4. High alive count late into match -> 1v15 Practice
-    if (obs.t >= 90 && obs.alive >= 14) {
-      ffaConfidence = clamp(
-        ffaConfidence - 0.04 * clamp(tickDt, 0.05, 0.5),
-        0,
-        1,
-      )
+    // 4. High alive count past t >= 30s -> 1v15 Practice
+    if (obs.t >= 30 && obs.alive >= 15) {
+      ffaConfidence = clamp(ffaConfidence - 0.08 * dt, 0, 1)
     }
   }
 

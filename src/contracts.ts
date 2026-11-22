@@ -23,8 +23,14 @@ export interface WorldQuery {
   surfaceZAt(x: number, y: number, currentZ: number): number
   /** Find a path of waypoints from `from` to `to` on the 4m navgrid (node-capped). */
   findPath(from: Vec3, to: Vec3, canJet: boolean): Vec3[]
-  /** Find a nearby cover position within `radius` that blocks LOS from `threats`. */
-  findCover(pos: Vec3, threats: Vec3[], radius: number): Vec3 | null
+  /** Find a nearby cover position within `radius` that blocks shot LOS from `threats` and satisfies optional `isSafe(x, y)`. */
+  findCover(
+    pos: Vec3,
+    threats: Vec3[],
+    radius: number,
+    isSafe?: (x: number, y: number) => boolean,
+    eyeHeight?: number,
+  ): Vec3 | null
 }
 
 export interface TrackedEnemy {

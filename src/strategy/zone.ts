@@ -55,7 +55,7 @@ export function isPointInSafeZone(
 ): boolean {
   const [cx, cy] = obs.zone.center
   const dist = Math.hypot(pos[0] - cx, pos[1] - cy)
-  if (dist > Math.max(0, obs.zone.radius - margin)) {
+  if (dist > Math.max(obs.zone.radius * 0.5, obs.zone.radius - margin)) {
     return false
   }
   // If shrink is active or imminent, prefer points not far outside next_radius

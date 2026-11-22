@@ -36,10 +36,51 @@ export function createWorld(mapDir: string, config: Config): WorldQuery {
     findPath(from: Vec3, to: Vec3, canJet: boolean): Vec3[] {
       return findPath(nav, from, to, canJet)
     },
-    findCover(pos: Vec3, threats: Vec3[], radius: number): Vec3 | null {
-      return findCover(nav, world, scratch, pos, threats, radius, canopyBlocks)
+    findCover(
+      pos: Vec3,
+      threats: Vec3[],
+      radius: number,
+      isSafe?: (x: number, y: number) => boolean,
+      eyeHeight = 8,
+    ): Vec3 | null {
+      return findCover(nav, world, scratch, pos, threats, radius, isSafe, eyeHeight)
     },
   }
+}
+
+const STEER_ANGLES = [0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.57, -1.57]
+
+function isSteerClear(
+  world: WorldQuery,
+  pos: Vec3,
+  dirX: number,
+  dirY: number,
+  maxSlopeDeg: number,
+  steps: number[],
+  checkLateral: boolean,
+): boolean {
+  const perpX = -dirY
+  const perpY = dirX
+
+  for (let s = 0; s < steps.length; s++) {
+    const step = steps[s]
+    const fx = pos[0] + dirX * step
+    const fy = pos[1] + dirY * step
+    const sz = world.surfaceZAt(fx, fy, pos[2])
+    if (sz - pos[2] > 1.5 || world.slopeAt(fx, fy) > maxSlopeDeg) {
+      return false
+    }
+    if (checkLateral) {
+      const lx = fx + perpX * 2.5
+      const ly = fy + perpY * 2.5
+      if (world.surfaceZAt(lx, ly, pos[2]) - pos[2] > 1.5) return false
+
+      const rx = fx - perpX * 2.5
+      const ry = fy - perpY * 2.5
+      if (world.surfaceZAt(rx, ry, pos[2]) - pos[2] > 1.5) return false
+    }
+  }
+  return true
 }
 
 export function computeLocalSteer(
@@ -54,16 +95,25 @@ export function computeLocalSteer(
   if (dist < 1e-4) return [0, 0]
 
   const baseYaw = Math.atan2(dy, dx)
-  const feelerDist = Math.min(4.0, dist)
-  const angles = [0, 0.55, -0.55, 1.05, -1.05]
+  const steps = dist < 2.0 ? [dist] : [2.0, Math.min(4.0, dist)]
 
-  for (let i = 0; i < angles.length; i++) {
-    const yaw = baseYaw + angles[i]
-    const fx = pos[0] + Math.cos(yaw) * feelerDist
-    const fy = pos[1] + Math.sin(yaw) * feelerDist
-    const sz = world.surfaceZAt(fx, fy, pos[2])
-    if (sz - pos[2] <= 1.4 && world.slopeAt(fx, fy) <= maxSlopeDeg) {
-      return [Math.cos(yaw), Math.sin(yaw)]
+  // Pass 1: 2m and 4m steps with +/- 2.5m lateral clearance
+  for (let i = 0; i < STEER_ANGLES.length; i++) {
+    const yaw = baseYaw + STEER_ANGLES[i]
+    const dirX = Math.cos(yaw)
+    const dirY = Math.sin(yaw)
+    if (isSteerClear(world, pos, dirX, dirY, maxSlopeDeg, steps, true)) {
+      return [dirX, dirY]
+    }
+  }
+
+  // Pass 2: center-line clearance fallback in tight corridors
+  for (let i = 0; i < STEER_ANGLES.length; i++) {
+    const yaw = baseYaw + STEER_ANGLES[i]
+    const dirX = Math.cos(yaw)
+    const dirY = Math.sin(yaw)
+    if (isSteerClear(world, pos, dirX, dirY, maxSlopeDeg, steps, false)) {
+      return [dirX, dirY]
     }
   }
 
